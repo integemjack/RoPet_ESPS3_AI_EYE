@@ -1,0 +1,18 @@
+idf_component_register(
+    SRCS
+        "main.c"
+        "bridge_uart.c"
+        "bridge_wifi.c"
+        "bridge_sock.c"
+    INCLUDE_DIRS
+        "."
+        ".."             # 引用工程根下的 bridge_protocol.h (与 S3 端共享)
+    REQUIRES
+        driver
+        esp_wifi
+        esp_netif
+        esp_event
+        nvs_flash
+        esp-tls
+        lwip
+)

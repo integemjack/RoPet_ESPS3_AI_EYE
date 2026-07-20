@@ -1,0 +1,23 @@
+# ---- C5 WiFi Bridge 默认配置 ----
+
+# 主频拉满, 保证 UART 高波特率 + 网络吞吐
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+
+# UART ISR 放入 IRAM, 高波特率下避免丢字节 (与 S3 侧 ML307 同样的做法)
+CONFIG_UART_ISR_IN_IRAM=y
+
+# 启用 5GHz 频段支持 (C5 双频)
+CONFIG_ESP_WIFI_ENABLE_DUAL_BAND=y
+
+# mbedTLS: 允许 TLS 客户端, 用于 wss:// / mqtts:// / https://
+CONFIG_MBEDTLS_SSL_PROTO_TLS1_3=y
+CONFIG_MBEDTLS_CLIENT_SSL_SESSION_TICKETS=y
+
+# 增大 socket 数量上限, 与 BRIDGE_MAX_LINKS 匹配留余量
+CONFIG_LWIP_MAX_SOCKETS=10
+
+# 日志等级
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+
+# 任务看门狗放宽 (网络阻塞时不误杀)
+CONFIG_ESP_TASK_WDT_TIMEOUT_S=10
