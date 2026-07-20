@@ -40,6 +40,7 @@ public:
 protected:
     int width_ = 0;
     int height_ = 0;
+    int low_p3 = 0;
     
     esp_pm_lock_handle_t pm_lock_ = nullptr;
     lv_display_t *display_ = nullptr;

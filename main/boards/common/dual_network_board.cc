@@ -66,8 +66,18 @@ void DualNetworkBoard::StartNetwork() {
     
     if (network_type_ == NetworkType::WIFI) {
         display->SetStatus(Lang::Strings::CONNECTING);
+        auto& app = Application::GetInstance();
+        app.PlaySound(Lang::Sounds::P3_WIFI_MODE);
+        vTaskDelay(pdMS_TO_TICKS(2000));
+        app.ResetDecoder();
+        app.PlaySound(Lang::Sounds::P3_NETING);
     } else {
         display->SetStatus(Lang::Strings::DETECTING_MODULE);
+        auto& app = Application::GetInstance();
+        app.PlaySound(Lang::Sounds::P3_4G_MODE);
+        vTaskDelay(pdMS_TO_TICKS(2000));
+        app.ResetDecoder();
+        app.PlaySound(Lang::Sounds::P3_NETING);
     }
     current_board_->StartNetwork();
 }

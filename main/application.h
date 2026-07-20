@@ -160,6 +160,7 @@ public:
     void UpdateIotStates();
     void Reboot();
     void WakeWordInvoke(const std::string& wake_word);
+    void ResetDecoder();    
     void PlaySound(const std::string_view& sound);
     bool CanEnterSleepMode();
     void SendMcpMessage(const std::string& payload);
@@ -274,7 +275,7 @@ private:
 #ifdef CONFIG_USE_AUDIO_CODEC_DECODE_OPUS
     void WriteAudio(std::vector<uint8_t>& opus, int sample_rate);
 #endif
-    void ResetDecoder();
+    
     void SetDecodeSampleRate(int sample_rate, int frame_duration);
     void CheckNewVersion();
     void ShowActivationCode();

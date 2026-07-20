@@ -65,7 +65,7 @@ private:
     void ReadBatteryAdcData() {
         // 读取 ADC 值
         int adc_value;
-        ESP_ERROR_CHECK(adc_oneshot_read(adc_handle_, ADC_CHANNEL_7, &adc_value));
+        ESP_ERROR_CHECK(adc_oneshot_read(adc_handle_, ADC_CHANNEL_5, &adc_value));
        
         
         // 将 ADC 值添加到队列中
@@ -75,7 +75,7 @@ private:
         }
         uint32_t average_adc = 0;
         for (auto value : adc_values_) {
-            average_adc += (value + 80);
+            average_adc += (value);
         }
         average_adc /= adc_values_.size();
 
@@ -174,7 +174,7 @@ public:
             .atten = ADC_ATTEN_DB_12,
             .bitwidth = ADC_BITWIDTH_12,
         };
-        ESP_ERROR_CHECK(adc_oneshot_config_channel(adc_handle_, ADC_CHANNEL_7, &chan_config));
+        ESP_ERROR_CHECK(adc_oneshot_config_channel(adc_handle_, ADC_CHANNEL_5, &chan_config));
 
         // 初始化温度传感器
         temperature_sensor_config_t temp_config = {

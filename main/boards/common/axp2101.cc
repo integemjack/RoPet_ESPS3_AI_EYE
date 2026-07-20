@@ -34,6 +34,14 @@ float Axp2101::GetTemperature() {
     return ReadReg(0xA5);
 }
 
+uint32_t Axp2101::Gethead_value() {
+    return ReadReg(0xA6);
+}
+
+uint32_t Axp2101::Getbody_value() {
+    return ReadReg(0xA7);
+}
+
 void Axp2101::PowerOff() {
     uint8_t value = ReadReg(0x10);
     value = value | 0x01;

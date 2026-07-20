@@ -12,6 +12,9 @@ public:
     int GetBatteryLevel();
     float GetTemperature();
     void PowerOff();
+    uint32_t Gethead_value();
+    uint32_t Getbody_value();
+    
 
 private:
     int GetBatteryCurrentDirection();

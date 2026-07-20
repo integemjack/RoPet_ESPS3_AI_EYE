@@ -132,6 +132,7 @@ void Display::UpdateStatusBar(bool update_all) {
             battery_icon_ = icon;
             lv_label_set_text(battery_label_, battery_icon_);
         }
+        
 
         if (low_battery_popup_ != nullptr) {
             if (strcmp(icon, FONT_AWESOME_BATTERY_EMPTY) == 0 && discharging) {

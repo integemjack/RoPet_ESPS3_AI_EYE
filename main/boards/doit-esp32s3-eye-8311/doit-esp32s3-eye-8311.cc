@@ -1,10 +1,11 @@
-#include "wifi_board.h"
-#include "audio_codecs/es8311_audio_codec.h"
+#include "dual_network_board.h"
+#include "audio_codecs/box_audio_codec.h"
 #include "display/lcd_display.h"
 #include "application.h"
 #include "button.h"
 #include "config.h"
 #include "i2c_device.h"
+#include "led/single_led.h"
 #include "iot/thing_manager.h"
 #include <esp_lcd_panel_io.h>
 #include <esp_lcd_panel_ops.h>
@@ -15,33 +16,65 @@
 #include <driver/i2c_master.h>
 #include <driver/spi_common.h>
 #include <wifi_station.h>
+#include "../zhengchen-1.54tft-wifi/power_manager.h"
+#include "driver/touch_pad.h"
 
 #include "esp_random.h"
 
 #define TAG "XiaoZhiEyeBoard"
 
-LV_FONT_DECLARE(font_puhui_20_4);   //表示名为 puhui 的字体,是一个常规字体，用于显示文本内容，大小为 14
-LV_FONT_DECLARE(font_awesome_20_4); //表示名为 font_awesome 的字体,是一个图标字体库，用于显示各种图标，大小为 14
+LV_FONT_DECLARE(font_puhui_20_4);   
+LV_FONT_DECLARE(font_awesome_20_4); 
 
 
-class XiaoZhiEyeBoard : public WifiBoard {
+class XiaoZhiEyeBoard : public DualNetworkBoard {
 private:
-    i2c_master_bus_handle_t codec_i2c_bus_;
+    i2c_master_bus_handle_t i2c_bus_;
     Button boot_button_;
     LcdDisplay* display_;
-     /* LCD IO and panel */
-    esp_lcd_panel_io_handle_t lcd_io1 = NULL;
-    esp_lcd_panel_handle_t lcd_panel1 = NULL;
-    esp_lcd_panel_io_handle_t lcd_io2 = NULL;
-    esp_lcd_panel_handle_t lcd_panel2 = NULL;
+    uint32_t touch_value = 0;
+    uint32_t touch_value1 = 0;
+    PowerManager* power_manager_ = new PowerManager(GPIO_NUM_7);
+    
+   
 
 // /* =================================*/
+    void touch_init() {
+        touch_pad_init();
+        touch_pad_config(TOUCH_PAD_NUM4); // 配置 GPIO4 为触摸引脚
+        touch_pad_config(TOUCH_PAD_NUM5); // 配置 GPIO5 为触摸引脚
+        touch_pad_set_fsm_mode(TOUCH_FSM_MODE_TIMER); // 设置 FSM 模式为定时器模式
+        touch_pad_fsm_start();
+        vTaskDelay(40 / portTICK_PERIOD_MS);
+    }
 
 
+    static void touch_read_task(void* arg) {
+        XiaoZhiEyeBoard* self = static_cast<XiaoZhiEyeBoard*>(arg);
+        auto& app = Application::GetInstance();
+        while (1) {
+            touch_pad_read_raw_data(TOUCH_PAD_NUM4, &self->touch_value);
+            touch_pad_read_raw_data(TOUCH_PAD_NUM5, &self->touch_value1);
+            if (self->touch_value > 30000) {
+                if (app.GetDeviceState() == kDeviceStateIdle) {
+                    app.WakeWordInvoke("(正在抚摸你的头，请提供相关的情绪价值，回答)");
+                }
+            }
+
+            if (self->touch_value1 > 30000) {
+                if (app.GetDeviceState() == kDeviceStateIdle) {
+                    app.WakeWordInvoke("(正在抚摸你的身体，请提供相关的情绪价值，回答)");
+                }
+            }
+            vTaskDelay(500 / portTICK_PERIOD_MS);
+        }
+    }
+
+    
     void InitializeI2c() {
         // Initialize I2C peripheral
         i2c_master_bus_config_t i2c_bus_cfg = {
-            .i2c_port = I2C_NUM_0,
+            .i2c_port = (i2c_port_t)1,
             .sda_io_num = AUDIO_CODEC_I2C_SDA_PIN,
             .scl_io_num = AUDIO_CODEC_I2C_SCL_PIN,
             .clk_source = I2C_CLK_SRC_DEFAULT,
@@ -52,192 +85,113 @@ private:
                 .enable_internal_pullup = 1,
             },
         };
-        ESP_ERROR_CHECK(i2c_new_master_bus(&i2c_bus_cfg, &codec_i2c_bus_));
+        ESP_ERROR_CHECK(i2c_new_master_bus(&i2c_bus_cfg, &i2c_bus_));
+
     }
 
-     //物联网初始化，添加对AI可见设备
-     void initializeIot() {
-        auto& thing_manager = iot::ThingManager::GetInstance();
-        thing_manager.AddThing(iot::CreateThing("Speaker"));
-        //thing_manager.AddThing(iot::CreateThing("Screen"));
-    }
-
+     
+    
     void InitializeButtons() {
         boot_button_.OnClick([this]() {
             auto& app = Application::GetInstance();
-            if (app.GetDeviceState() == kDeviceStateStarting && !WifiStation::GetInstance().IsConnected()) {
-                ResetWifiConfiguration();
+            if (GetNetworkType() == NetworkType::WIFI) {
+                if (app.GetDeviceState() == kDeviceStateStarting && !WifiStation::GetInstance().IsConnected()) {
+                    // cast to WifiBoard
+                    auto& wifi_board = static_cast<WifiBoard&>(GetCurrentBoard());
+                    wifi_board.ResetWifiConfiguration();
+                }
             }
             app.ToggleChatState();
         });
-    }
 
-    // GC9A01-SPI2初始化-用于显示小智
-    void InitializeSpiEye1() {
-        const spi_bus_config_t buscfg = {       
-            .mosi_io_num = GC9A01_SPI1_LCD_GPIO_MOSI,
-            .miso_io_num = GPIO_NUM_NC,
-            .sclk_io_num = GC9A01_SPI1_LCD_GPIO_SCLK,
-            .quadwp_io_num = GPIO_NUM_NC,
-            .quadhd_io_num = GPIO_NUM_NC,
-            .max_transfer_sz = GC9A01_LCD_H_RES * GC9A01_LCD_V_RES * sizeof(uint16_t), // 增大传输大小,
-        };
-        ESP_ERROR_CHECK(spi_bus_initialize(GC9A01_LCD_SPI1_NUM, &buscfg, SPI_DMA_CH_AUTO));
-    }
+        boot_button_.OnMultipleClick([this]() {
+            SwitchNetworkType();
+        });
 
-    // GC9A01-SPI2初始化-用于显示魔眼
-    void InitializeGc9a01DisplayEye1() {
-        ESP_LOGI(TAG, "Init GC9A01 display1");
-
-        ESP_LOGI(TAG, "Install panel IO1");
-        ESP_LOGD(TAG, "Install panel IO1");
-        const esp_lcd_panel_io_spi_config_t io_config = {
-            .cs_gpio_num = GC9A01_SPI1_LCD_GPIO_CS,
-            .dc_gpio_num = GC9A01_SPI1_LCD_GPIO_DC,
-            .spi_mode = 0,
-            .pclk_hz = GC9A01_LCD_PIXEL_CLK_HZ,
-            .trans_queue_depth = 10,
-            .lcd_cmd_bits = GC9A01_LCD_CMD_BITS,
-            .lcd_param_bits = GC9A01_LCD_PARAM_BITS,
-            
-    
-        };
-        esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)GC9A01_LCD_SPI1_NUM, &io_config, &lcd_io1);
-    
-        ESP_LOGD(TAG, "Install LCD1 driver");
-        esp_lcd_panel_dev_config_t panel_config = {
-            .reset_gpio_num = GC9A01_SPI1_LCD_GPIO_RST,
-            .color_space = GC9A01_LCD_COLOR_SPACE,
-            .bits_per_pixel = GC9A01_LCD_BITS_PER_PIXEL,
-            
-        };
-        panel_config.rgb_endian = DISPLAY_RGB_ORDER;
-        esp_lcd_new_panel_gc9a01(lcd_io1, &panel_config, &lcd_panel1);
-        
-        esp_lcd_panel_reset(lcd_panel1);
-        esp_lcd_panel_init(lcd_panel1);
-        esp_lcd_panel_invert_color(lcd_panel1, true);
-        esp_lcd_panel_disp_on_off(lcd_panel1, true);
-    }
-
-     // GC9A01-SPI2初始化-用于显示魔眼
-     void InitializeSpiEye2() {
-        const spi_bus_config_t buscfg = {       
-            .mosi_io_num = GC9A01_SPI2_LCD_GPIO_MOSI,
-            .miso_io_num = GPIO_NUM_NC,
-            .sclk_io_num = GC9A01_SPI2_LCD_GPIO_SCLK,
-            .quadwp_io_num = GPIO_NUM_NC,
-            .quadhd_io_num = GPIO_NUM_NC,
-            .max_transfer_sz = GC9A01_LCD_H_RES * GC9A01_LCD_V_RES * sizeof(uint16_t),
-        };
-        ESP_ERROR_CHECK(spi_bus_initialize(GC9A01_LCD_SPI2_NUM, &buscfg, SPI_DMA_CH_AUTO));
-    }
-
-    // GC9A01-SPI2初始化-用于显示魔眼
-    void InitializeGc9a01DisplayEye2() {
-        ESP_LOGI(TAG, "Init GC9A01 display2");
-
-        ESP_LOGI(TAG, "Install panel IO2");
-        ESP_LOGD(TAG, "Install panel IO2");
-        const esp_lcd_panel_io_spi_config_t io_config = {
-            .cs_gpio_num = GC9A01_SPI2_LCD_GPIO_CS,
-            .dc_gpio_num = GC9A01_SPI2_LCD_GPIO_DC,
-            .spi_mode = 0,
-            .pclk_hz = GC9A01_LCD_PIXEL_CLK_HZ,
-            .trans_queue_depth = 10,
-            .lcd_cmd_bits = GC9A01_LCD_CMD_BITS,
-            .lcd_param_bits = GC9A01_LCD_PARAM_BITS,
-    
-    
-        };
-        esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)GC9A01_LCD_SPI2_NUM, &io_config, &lcd_io2);
-    
-        ESP_LOGD(TAG, "Install LCD2 driver");
-        esp_lcd_panel_dev_config_t panel_config = {
-            .reset_gpio_num = GC9A01_SPI2_LCD_GPIO_RST,
-            .color_space = GC9A01_LCD_COLOR_SPACE,
-            .bits_per_pixel = GC9A01_LCD_BITS_PER_PIXEL
-        };
-           panel_config.rgb_endian = DISPLAY_RGB_ORDER;
-        esp_lcd_new_panel_gc9a01(lcd_io2, &panel_config, &lcd_panel2);
-        esp_lcd_panel_reset(lcd_panel2);
-        esp_lcd_panel_init(lcd_panel2);
-        esp_lcd_panel_invert_color(lcd_panel2, true);
-        esp_lcd_panel_disp_on_off(lcd_panel2, true);
-        
-    }
-
-    //初始化双屏
-    void InitializeDualScreenEye(){
-        // 初始化第一块屏幕
-        InitializeSpiEye1();
-        InitializeSpiEye2();
-        InitializeGc9a01DisplayEye1();
-        InitializeGc9a01DisplayEye2();
-
-        // 创建双屏显示对象
-        display_ = new DualScreenDisplay(
-            lcd_io1, lcd_panel1,
-            lcd_io2, lcd_panel2,
-            DISPLAY_WIDTH, DISPLAY_HEIGHT, DISPLAY_OFFSET_X, DISPLAY_OFFSET_Y,
-            DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y, DISPLAY_SWAP_XY,
-            {
-                .text_font = &font_puhui_20_4,
-                .icon_font = &font_awesome_20_4,
-                .emoji_font = font_emoji_64_init(),
+        boot_button_.OnLongPress([this]() {
+            if (GetNetworkType() == NetworkType::WIFI) {
+                auto& wifi_board = static_cast<WifiBoard&>(GetCurrentBoard());
+                wifi_board.ResetWifiConfiguration();
             }
-        );
-        // display_ = new SpiLcdDisplay(lcd_io1, lcd_panel1,
-        //     DISPLAY_WIDTH, DISPLAY_HEIGHT, DISPLAY_OFFSET_X, DISPLAY_OFFSET_Y, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y, DISPLAY_SWAP_XY,
-        //     {
-        //         .text_font = &font_puhui_20_4,
-        //         .icon_font = &font_awesome_20_4,
-        //         .emoji_font = font_emoji_64_init(),
-        //     });
+            
+        });
+
+#if CONFIG_USE_DEVICE_AEC
+        boot_button_.OnDoubleClick([this]() {
+            auto& app = Application::GetInstance();
+            app.SetAecMode(app.GetAecMode() == kAecOff ? kAecOnDeviceSide : kAecOff);
+            
+        });
+#endif
     }
 
+   
 
 public:
 
-  //没有按键
-  XiaoZhiEyeBoard() : boot_button_(BOOT_BUTTON_GPIO) {
-    gpio_set_direction(AUDIO_CODEC_PA_PIN, GPIO_MODE_OUTPUT);
-    gpio_set_pull_mode(AUDIO_CODEC_PA_PIN, GPIO_PULLDOWN_ONLY);
-    gpio_set_level(AUDIO_CODEC_PA_PIN, 0); //初始化
+  XiaoZhiEyeBoard() : DualNetworkBoard(ML307_TX_PIN, ML307_RX_PIN, 4096),boot_button_(BOOT_BUTTON_GPIO) {
     InitializeI2c();
-    InitializeDualScreenEye();
     InitializeButtons();
-    initializeIot();
-    //GetBacklight()->SetBrightness(100);
+    touch_init();
+    GetAudioCodec()->SetOutputVolume(100);
+    xTaskCreate(touch_read_task, "touch_read_task", 2048, this, 5, NULL);
 }
 
 
-  virtual AudioCodec* GetAudioCodec() override {
-    static Es8311AudioCodec audio_codec(
-        codec_i2c_bus_, 
-        I2C_NUM_0, 
-        AUDIO_INPUT_SAMPLE_RATE, 
-        AUDIO_OUTPUT_SAMPLE_RATE,
-        AUDIO_I2S_GPIO_MCLK, 
-        AUDIO_I2S_GPIO_BCLK, 
-        AUDIO_I2S_GPIO_WS, 
-        AUDIO_I2S_GPIO_DOUT, 
-        AUDIO_I2S_GPIO_DIN,
-        AUDIO_CODEC_PA_PIN, 
-        AUDIO_CODEC_ES8311_ADDR);
-    return &audio_codec;
-}
-
-    virtual Display* GetDisplay() override {
-        return display_;
+    virtual AudioCodec* GetAudioCodec() override {
+        static BoxAudioCodec audio_codec(
+            i2c_bus_, 
+            AUDIO_INPUT_SAMPLE_RATE, 
+            AUDIO_OUTPUT_SAMPLE_RATE,
+            AUDIO_I2S_GPIO_MCLK, 
+            AUDIO_I2S_GPIO_BCLK, 
+            AUDIO_I2S_GPIO_WS, 
+            AUDIO_I2S_GPIO_DOUT, 
+            AUDIO_I2S_GPIO_DIN,
+            GPIO_NUM_NC, 
+            AUDIO_CODEC_ES8311_ADDR, 
+            AUDIO_CODEC_ES7210_ADDR, 
+            AUDIO_INPUT_REFERENCE);
+        return &audio_codec;
     }
 
-    //virtual Backlight* GetBacklight() override {
-    //    static PwmBacklight backlight(DISPLAY_BACKLIGHT_PIN, DISPLAY_BACKLIGHT_OUTPUT_INVERT);
-    //    return &backlight;
-    //}
+    
+
+    virtual Led* GetLed() override {
+        static SingleLed led(BUILTIN_LED_GPIO);
+        return &led;
+    }
 
 
+    
+
+    virtual bool GetBatteryLevel(int& level, bool& charging, bool& discharging)  override {
+        static bool last_discharging = false;
+        charging = power_manager_->IsCharging();
+        discharging = power_manager_->IsDischarging();
+        if (discharging != last_discharging) {
+            last_discharging = discharging;
+        }
+        level = std::max<uint32_t>(power_manager_->GetBatteryLevel(), 0);
+        return true;
+    }
+    
+    virtual bool GetTemperature(float& esp32temp)  override {
+        esp32temp = power_manager_->GetTemperature();
+        return true;
+    }
+
+    virtual bool Gethead_value(uint32_t& head_value)  override {
+        head_value = touch_value;
+        printf("Touch1 value: %ld\n", touch_value);
+        return true;
+    }
+
+    virtual bool Getbody_value(uint32_t& body_value)  override {
+        body_value = touch_value1;
+        printf("Touch2 value: %ld\n", touch_value1);
+        return true;
+    }
 };
 
 DECLARE_BOARD(XiaoZhiEyeBoard);

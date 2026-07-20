@@ -1218,14 +1218,20 @@ void Application::SetAecMode(AecMode mode) {
         case kAecOff:
             audio_processor_->EnableDeviceAec(false);
             display->ShowNotification(Lang::Strings::RTC_MODE_OFF);
+            ResetDecoder();
+            PlaySound(Lang::Sounds::P3_AEC_OFF);
             break;
         case kAecOnServerSide:
             audio_processor_->EnableDeviceAec(false);
             display->ShowNotification(Lang::Strings::RTC_MODE_ON);
+            ResetDecoder();
+            PlaySound(Lang::Sounds::P3_AEC_NO);
             break;
         case kAecOnDeviceSide:
             audio_processor_->EnableDeviceAec(true);
             display->ShowNotification(Lang::Strings::RTC_MODE_ON);
+            ResetDecoder();
+            PlaySound(Lang::Sounds::P3_AEC_NO);
             break;
         }
 

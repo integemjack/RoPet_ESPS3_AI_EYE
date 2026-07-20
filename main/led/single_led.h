@@ -22,6 +22,7 @@ private:
     uint8_t r_ = 0, g_ = 0, b_ = 0;
     int blink_counter_ = 0;
     int blink_interval_ms_ = 0;
+    int low_p3 = 0;
     esp_timer_handle_t blink_timer_ = nullptr;
 
     void StartBlinkTask(int times, int interval_ms);
