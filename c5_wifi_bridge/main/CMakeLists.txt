@@ -2,7 +2,7 @@ idf_component_register(
     SRCS
         "main.c"
         "bridge_uart.c"
-        "bridge_wifi.c"
+        "bridge_wifi.cc"
         "bridge_sock.c"
     INCLUDE_DIRS
         "."
@@ -15,4 +15,5 @@ idf_component_register(
         nvs_flash
         esp-tls
         lwip
+        78__esp-wifi-connect
 )

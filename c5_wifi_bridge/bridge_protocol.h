@@ -38,9 +38,9 @@ typedef enum {
     /* ---- S3 -> C5 : 控制 ---- */
     BRIDGE_CMD_PING          = 0x01, /* payload: 空; C5 回 EVT_PONG */
     BRIDGE_CMD_RESET         = 0x02, /* 复位 C5 (重启) */
-    BRIDGE_CMD_WIFI_CONFIG   = 0x03, /* payload: bridge_wifi_config_t 变长 (ssid_len,u8)(ssid)(pwd) */
-    BRIDGE_CMD_WIFI_CONNECT  = 0x04, /* 用已配置凭据发起连接 */
-    BRIDGE_CMD_WIFI_DISCONNECT = 0x05,
+    BRIDGE_CMD_WIFI_CONFIG   = 0x03, /* [已废弃] 配网改由 C5 自主完成(SoftAP+网页), S3 不下发凭据 */
+    BRIDGE_CMD_WIFI_CONNECT  = 0x04, /* 让 C5 (重新)启动网络: 用已存凭据连, 无则自动开热点配网 */
+    BRIDGE_CMD_WIFI_DISCONNECT = 0x05, /* [保留] */
     BRIDGE_CMD_GET_STATUS    = 0x06, /* 请求上报状态; C5 回 EVT_WIFI_STATUS */
 
     /* ---- S3 -> C5 : socket ---- */

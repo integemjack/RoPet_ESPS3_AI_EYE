@@ -1,0 +1,7 @@
+## C5 WiFi Bridge 的组件依赖
+## 直接复用小智同款配网组件, 保证配网网页与小智完全一致
+dependencies:
+  idf: '>=5.3'
+  # 与主工程 (S3) 保持同一版本, 保证配网网页/API 完全一致 (该版本为单例 GetInstance API)。
+  # 若要配网扫描页支持显示 5G AP 列表, 可升级到 3.x, 但需把 bridge_wifi.cc 改为实例化(非单例)写法。
+  78/esp-wifi-connect: '~2.4.2'

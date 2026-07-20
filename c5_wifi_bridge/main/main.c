@@ -28,28 +28,10 @@ void bridge_dispatch_frame(uint8_t type, uint8_t link_id,
         esp_restart();
         break;
 
-    case BRIDGE_CMD_WIFI_CONFIG: {
-        /* payload: [ssid_len(1)][ssid][pwd...] */
-        if (len < 1) break;
-        uint8_t ssid_len = payload[0];
-        if (1 + ssid_len > len) break;
-        char ssid[33] = {0};
-        char pwd[65] = {0};
-        uint8_t sl = ssid_len < 32 ? ssid_len : 32;
-        memcpy(ssid, &payload[1], sl);
-        uint16_t pwd_len = len - 1 - ssid_len;
-        uint16_t pl = pwd_len < 64 ? pwd_len : 64;
-        if (pwd_len > 0) memcpy(pwd, &payload[1 + ssid_len], pl);
-        bridge_wifi_set_config(ssid, pwd);
-        break;
-    }
-
+    /* 配网/凭据/连接全部在 C5 自主完成 (复用 esp-wifi-connect),
+     * S3 不再下发 WiFi 凭据。这里只保留一个"主动启动网络"命令备用。 */
     case BRIDGE_CMD_WIFI_CONNECT:
-        bridge_wifi_connect();
-        break;
-
-    case BRIDGE_CMD_WIFI_DISCONNECT:
-        bridge_wifi_disconnect();
+        bridge_wifi_start();
         break;
 
     case BRIDGE_CMD_GET_STATUS:
@@ -95,7 +77,10 @@ void app_main(void)
 
     /* 告诉 S3: C5 已就绪 (对应 ML307 的 OnMaterialReady) */
     bridge_send_frame(BRIDGE_EVT_READY, BRIDGE_NO_LINK, NULL, 0);
-    ESP_LOGI(TAG, "ready, waiting for host commands");
+    ESP_LOGI(TAG, "ready");
+
+    /* C5 自主启动网络: 用 NVS 里存的凭据连; 没有则自动开热点配网 */
+    bridge_wifi_start();
 
     /* 周期性上报状态, 让 S3 侧信号图标能刷新 */
     while (1) {

@@ -36,11 +36,9 @@ void bridge_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 void bridge_dispatch_frame(uint8_t type, uint8_t link_id,
                            const uint8_t *payload, uint16_t len);
 
-/* ---- WiFi 层 ---- */
-void bridge_wifi_init(void);
-void bridge_wifi_set_config(const char *ssid, const char *pwd);
-void bridge_wifi_connect(void);
-void bridge_wifi_disconnect(void);
+/* ---- WiFi 层 (复用 78/esp-wifi-connect, 配网/存储/连接全在 C5) ---- */
+void bridge_wifi_init(void);   /* 初始化 nvs/netif/wifi 驱动 */
+void bridge_wifi_start(void);  /* 用已存凭据连接; 失败则开热点配网 */
 /* 填充并主动上报一次 WiFi 状态帧 */
 void bridge_wifi_report_status(void);
 bool bridge_wifi_is_connected(void);

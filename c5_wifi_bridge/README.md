@@ -50,11 +50,33 @@ C5 引脚在 `main/bridge_internal.h` 里改：`BRIDGE_UART_TX_PIN` / `BRIDGE_UA
 - 消息类型见 `bridge_protocol.h`
 
 典型音频通道流程（S3 视角）：
-1. `WIFI_CONFIG` + `WIFI_CONNECT` → 等 `EVT_WIFI_STATUS.connected=1`
+1. 上电后 C5 自主连 WiFi（或开热点配网）。S3 只需等 `EVT_WIFI_STATUS.connected=1`
+   （必要时可发 `WIFI_CONNECT` 让 C5 重启网络流程）
 2. `SOCK_OPEN(link=0, proto=TLS, host, 443)` → 等 `EVT_SOCK_OPENED.ok=1`（WebSocket 用）
 3. `SOCK_OPEN(link=1, proto=UDP, host, port)` → 音频包（MQTT+UDP 模式）
 4. `SOCK_SEND` 发数据；C5 收到网络数据回 `EVT_SOCK_DATA`
 5. 断开回 `EVT_SOCK_CLOSED`
+
+## WiFi 配网：完全在 C5 上（不占用 S3）
+
+WiFi 的配网、凭据存储、连接三件事**全部由 C5 负责**，S3 完全不碰 WiFi：
+
+| 职责 | 归谁 | 用什么 |
+|------|------|--------|
+| 配网网页 (SoftAP + captive portal) | C5 | `WifiConfigurationAp`（小智同款组件） |
+| 凭据存储 | C5 的 NVS | `SsidManager`（同款） |
+| 连 WiFi（含 5G） | C5 | `WifiStation`（同款，全信道扫描优先信号最强） |
+
+C5 直接依赖 `78/esp-wifi-connect`（与主工程 S3 **同一版本 2.4.3**），所以配网网页和小智
+**完全一样**——这就是"把小智的配网网页整套搬到 C5 上"。
+
+C5 上电后的 WiFi 状态机（与小智纯 WiFi 版行为一致）：
+1. 读 C5 NVS 里已保存的凭据，尝试连接（60s）
+2. 连不上 / 没有凭据 → 自动开热点 `Xiaozhi-xxxx` + 配网网页（`http://192.168.4.1`）
+3. 用户在网页填 WiFi（可选 5G）→ 存入 C5 NVS → C5 重启后自动连
+
+> 首次使用：手机连 C5 的 `Xiaozhi-xxxx` 热点，浏览器打开 `192.168.4.1` 配网。
+> 之后 C5 会记住凭据自动连，无需 S3 参与。
 
 ## S3 侧如何接入（不动 4G 的代码）
 
