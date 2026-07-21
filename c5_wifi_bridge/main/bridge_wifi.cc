@@ -27,6 +27,7 @@
 #include "wifi_station.h"
 #include "wifi_configuration_ap.h"
 #include "ssid_manager.h"
+#include "nvs.h"
 
 static const char *TAG = "bridge_wifi";
 
@@ -61,6 +62,8 @@ static void enter_config_mode()
     auto &wifi_ap = WifiConfigurationAp::GetInstance();
     wifi_ap.SetLanguage("zh-CN");
     wifi_ap.SetSsidPrefix("Xiaozhi");
+    // 注意: esp-wifi-connect 2.4.3 的配网页默认就显示 OTA 地址输入框,
+    // 无需额外开关。用户填写后会存入 C5 NVS 的 wifi.ota_url。
     wifi_ap.Start();
 
     bridge_log("C5 WiFi config mode. hotspot: %s url: %s",
@@ -107,6 +110,29 @@ extern "C" bool bridge_wifi_is_connected(void)
 {
     if (s_config_mode) return false;
     return WifiStation::GetInstance().IsConnected();
+}
+
+extern "C" void bridge_wifi_report_ota_url(void)
+{
+    /* 从 C5 的 NVS wifi.ota_url 读取配网页保存的 OTA 地址, 回传 S3。
+     * esp-wifi-connect 的配网页 /advanced/submit 会写入这个 key。 */
+    char ota_url[256] = {0};
+    size_t len = sizeof(ota_url);
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open("wifi", NVS_READONLY, &nvs);
+    if (err == ESP_OK) {
+        err = nvs_get_str(nvs, "ota_url", ota_url, &len);
+        nvs_close(nvs);
+    }
+    if (err != ESP_OK) {
+        ota_url[0] = '\0';   /* 未配置: 回传空字符串 */
+        len = 0;
+    } else {
+        len = strlen(ota_url);
+    }
+    ESP_LOGI(TAG, "report ota_url: '%s'", ota_url);
+    bridge_send_frame(BRIDGE_EVT_OTA_URL, BRIDGE_NO_LINK,
+                      (const uint8_t *)ota_url, (uint16_t)len);
 }
 
 extern "C" void bridge_wifi_report_status(void)

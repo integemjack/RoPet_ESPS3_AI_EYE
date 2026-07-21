@@ -48,6 +48,39 @@ void Esp32C5Board::WaitForNetworkReady() {
     ESP_LOGI(TAG, "C5 WiFi ready, ip=%s rssi=%d band=%dG",
              bridge_.GetIpAddress().c_str(), bridge_.GetRssi(),
              bridge_.GetBand() == 2 ? 5 : 2);
+
+    // 从 C5 配网页取回单独配置的 OTA 地址, 同步到 S3 自己的 NVS。
+    // Ota::GetCheckVersionUrl() 读的是 S3 的 Settings("wifi").ota_url,
+    // 而配网页把地址存在 C5 的 NVS, 所以必须在这里把它搬到 S3 侧。
+    SyncOtaUrlFromC5();
+}
+
+void Esp32C5Board::SyncOtaUrlFromC5() {
+    // 获取失败(通信超时)就一直重试, 直到 C5 明确返回结果为止。
+    // 注意: FetchOtaUrl 返回 true 表示收到有效响应(即使是空串, 代表该机未配置);
+    //       返回 false 表示超时, 需要继续重试。
+    auto display = Board::GetInstance().GetDisplay();
+    std::string ota_url;
+    int attempt = 0;
+    while (!bridge_.FetchOtaUrl(ota_url, 5000)) {
+        attempt++;
+        ESP_LOGW(TAG, "fetch ota_url from C5 timeout, retry #%d ...", attempt);
+        // 长时间取不到多半是 C5 未就绪/接线问题, 给现场一个可见提示
+        if (attempt == 3) {
+            display->SetStatus(Lang::Strings::REGISTERING_NETWORK);
+        }
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+
+    Settings settings("wifi", true);
+    if (!ota_url.empty()) {
+        settings.SetString("ota_url", ota_url);
+        ESP_LOGI(TAG, "synced ota_url from C5 to S3 NVS: %s", ota_url.c_str());
+    } else {
+        // C5 上未配置 OTA 地址: 清掉 S3 上可能残留的旧值, 回落到编译期默认
+        settings.SetString("ota_url", "");
+        ESP_LOGI(TAG, "C5 has no ota_url, cleared S3 setting (use default)");
+    }
 }
 
 Http* Esp32C5Board::CreateHttp() {

@@ -18,6 +18,7 @@
 #include <mutex>
 
 #include <driver/gpio.h>
+#include <driver/uart.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 #include <freertos/event_groups.h>
@@ -70,6 +71,11 @@ public:
     void RequestStatus();
     void RequestWifiStart();
 
+    // 向 C5 请求配网页保存的 OTA 地址并等待返回。
+    // 返回 true 且 out_url 有值表示 C5 上配置了地址; 空字符串表示未配置。
+    // 超时返回 false。
+    bool FetchOtaUrl(std::string& out_url, int timeout_ms = 5000);
+
     // 低层发帧 (线程安全)
     bool SendFrame(uint8_t type, uint8_t link_id, const uint8_t* payload, uint16_t len);
 
@@ -78,10 +84,10 @@ private:
     void DispatchFrame(uint8_t type, uint8_t link_id, const uint8_t* payload, uint16_t len);
     static void RxTaskEntry(void* arg);
 
-    gpio_num_t tx_pin_;
-    gpio_num_t rx_pin_;
-    size_t     rx_buffer_size_;
-    int        uart_port_;
+    gpio_num_t   tx_pin_;
+    gpio_num_t   rx_pin_;
+    size_t       rx_buffer_size_;
+    uart_port_t  uart_port_;
 
     SemaphoreHandle_t tx_lock_ = nullptr;
     EventGroupHandle_t events_ = nullptr;   // ready / wifi-connected 位
@@ -96,6 +102,10 @@ private:
     volatile int  wifi_band_ = 0;
     uint8_t wifi_ip_[4] = {0,0,0,0};
     mutable std::mutex status_mutex_;
+
+    // OTA 地址 (从 C5 配网页取回)
+    std::string ota_url_;
+    std::mutex  ota_url_mutex_;
 };
 
 #endif // C5_BRIDGE_H

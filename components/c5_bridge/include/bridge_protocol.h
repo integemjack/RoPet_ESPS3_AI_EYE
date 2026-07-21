@@ -36,6 +36,7 @@ typedef enum {
     BRIDGE_CMD_WIFI_CONNECT  = 0x04,
     BRIDGE_CMD_WIFI_DISCONNECT = 0x05,
     BRIDGE_CMD_GET_STATUS    = 0x06,
+    BRIDGE_CMD_GET_OTA_URL   = 0x07, /* 请求 C5 配网页保存的 OTA 地址; C5 回 EVT_OTA_URL */
 
     BRIDGE_CMD_SOCK_OPEN     = 0x10,
     BRIDGE_CMD_SOCK_SEND     = 0x11,
@@ -45,6 +46,7 @@ typedef enum {
     BRIDGE_EVT_READY         = 0x80,
     BRIDGE_EVT_PONG          = 0x81,
     BRIDGE_EVT_WIFI_STATUS   = 0x82,
+    BRIDGE_EVT_OTA_URL       = 0x83, /* payload: OTA 地址字符串 (可空) */
     BRIDGE_EVT_SOCK_OPENED   = 0x90,
     BRIDGE_EVT_SOCK_DATA     = 0x91,
     BRIDGE_EVT_SOCK_CLOSED   = 0x92,

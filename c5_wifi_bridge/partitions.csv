@@ -1,0 +1,6 @@
+# C5 WiFi Bridge 分区表 (4MB flash)
+# 固件较大 (含 WiFi 栈 + TLS + 配网组件), factory 给到 2MB
+# Name,   Type, SubType, Offset,  Size,  Flags
+nvs,      data, nvs,     0x9000,  0x6000,
+phy_init, data, phy,     0xf000,  0x1000,
+factory,  app,  factory, 0x10000, 0x200000,

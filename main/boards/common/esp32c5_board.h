@@ -12,6 +12,7 @@ protected:
 
     virtual std::string GetBoardJson() override;
     void WaitForNetworkReady();
+    void SyncOtaUrlFromC5();
 
 public:
     Esp32C5Board(gpio_num_t tx_pin, gpio_num_t rx_pin, size_t rx_buffer_size = 8192);

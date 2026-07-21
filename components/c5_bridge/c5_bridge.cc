@@ -12,6 +12,7 @@
 
 #define EV_C5_READY        BIT0
 #define EV_WIFI_CONNECTED  BIT1
+#define EV_OTA_URL         BIT2
 
 static uint16_t crc16_ccitt(const uint8_t* data, size_t len, uint16_t crc)
 {
@@ -188,6 +189,16 @@ void C5Bridge::DispatchFrame(uint8_t type, uint8_t link_id, const uint8_t* paylo
         break;
     }
 
+    case BRIDGE_EVT_OTA_URL: {
+        {
+            std::lock_guard<std::mutex> lk(ota_url_mutex_);
+            ota_url_.assign((const char*)payload, len);
+        }
+        xEventGroupSetBits(events_, EV_OTA_URL);
+        ESP_LOGI(TAG, "received ota_url from C5 (len=%u)", len);
+        break;
+    }
+
     case BRIDGE_EVT_LOG:
         ESP_LOGI("C5", "%.*s", (int)len, (const char*)payload);
         break;
@@ -284,4 +295,17 @@ void C5Bridge::RequestStatus() {
 
 void C5Bridge::RequestWifiStart() {
     SendFrame(BRIDGE_CMD_WIFI_CONNECT, BRIDGE_NO_LINK, nullptr, 0);
+}
+
+bool C5Bridge::FetchOtaUrl(std::string& out_url, int timeout_ms) {
+    xEventGroupClearBits(events_, EV_OTA_URL);
+    SendFrame(BRIDGE_CMD_GET_OTA_URL, BRIDGE_NO_LINK, nullptr, 0);
+    EventBits_t bits = xEventGroupWaitBits(events_, EV_OTA_URL, pdTRUE, pdTRUE,
+                                           pdMS_TO_TICKS(timeout_ms));
+    if (!(bits & EV_OTA_URL)) {
+        return false;   // 超时
+    }
+    std::lock_guard<std::mutex> lk(ota_url_mutex_);
+    out_url = ota_url_;
+    return true;
 }

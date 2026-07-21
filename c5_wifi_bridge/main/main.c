@@ -38,6 +38,10 @@ void bridge_dispatch_frame(uint8_t type, uint8_t link_id,
         bridge_wifi_report_status();
         break;
 
+    case BRIDGE_CMD_GET_OTA_URL:
+        bridge_wifi_report_ota_url();
+        break;
+
     case BRIDGE_CMD_SOCK_OPEN: {
         /* payload: bridge_sock_open_t + host[host_len] */
         if (len < sizeof(bridge_sock_open_t)) break;

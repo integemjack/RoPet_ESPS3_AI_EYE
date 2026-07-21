@@ -42,6 +42,7 @@ typedef enum {
     BRIDGE_CMD_WIFI_CONNECT  = 0x04, /* 让 C5 (重新)启动网络: 用已存凭据连, 无则自动开热点配网 */
     BRIDGE_CMD_WIFI_DISCONNECT = 0x05, /* [保留] */
     BRIDGE_CMD_GET_STATUS    = 0x06, /* 请求上报状态; C5 回 EVT_WIFI_STATUS */
+    BRIDGE_CMD_GET_OTA_URL   = 0x07, /* 请求 C5 配网页保存的 OTA 地址; C5 回 EVT_OTA_URL */
 
     /* ---- S3 -> C5 : socket ---- */
     BRIDGE_CMD_SOCK_OPEN     = 0x10, /* payload: bridge_sock_open_t 头 + host 字符串 */
@@ -53,6 +54,7 @@ typedef enum {
     BRIDGE_EVT_READY         = 0x80, /* C5 启动完成 */
     BRIDGE_EVT_PONG          = 0x81,
     BRIDGE_EVT_WIFI_STATUS   = 0x82, /* payload: bridge_wifi_status_t */
+    BRIDGE_EVT_OTA_URL       = 0x83, /* payload: OTA 地址字符串 (可空, 空表示未配置) */
     BRIDGE_EVT_SOCK_OPENED   = 0x90, /* payload: bridge_sock_result_t (link_id 在帧头) */
     BRIDGE_EVT_SOCK_DATA     = 0x91, /* payload: 原始数据 */
     BRIDGE_EVT_SOCK_CLOSED   = 0x92, /* 远端关闭或出错 */
