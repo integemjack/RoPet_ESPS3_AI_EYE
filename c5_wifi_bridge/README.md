@@ -112,9 +112,28 @@ C5 上电后的 WiFi 状态机（与小智纯 WiFi 版行为一致）：
 - 在 `bridge_sock_open` 的 TLS 分支设 `cfg.crt_bundle_attach = esp_crt_bundle_attach;`
   并 `#include "esp_crt_bundle.h"`，同时去掉 `skip_common_name`。
 
+## S3 端接入现状 (已完成)
+
+S3 端已实现, 位于:
+- `components/c5_bridge/`  — S3 侧驱动组件:
+  - `c5_bridge.{h,cc}`   UART 帧引擎 + link(socket) 管理 + WiFi 状态
+  - `c5_transport.{h,cc}` 实现 esp-ml307 的 `Transport` (TCP/TLS), 供 `WebSocket` 使用
+  - `c5_udp.{h,cc}`       实现 `Udp` 抽象 (音频 UDP)
+  - `c5_mqtt.{h,cc}`      在 Transport 上实现精简 MQTT 3.1.1 客户端
+  - `c5_http.{h,cc}`      在 Transport 上实现精简 HTTP/1.1 客户端 (OTA/配置)
+  - `include/bridge_protocol.h` 与本工程根的协议头保持一致
+- `main/boards/common/esp32c5_board.{h,cc}` — 平行于 `Ml307Board` 的 C5 板卡
+- `main/boards/common/dual_network_board.*`  — 新增 `NetworkType::C5` 分支
+
+网络类型 (NVS `network.type`): 0=WiFi(S3自带) 1=ML307(4G) 2=C5(WiFi网桥)。
+`SwitchNetworkType()` 三态循环切换。**ML307(4G) 代码路径零改动。**
+
+> 重要: 本项目锁定 `78/esp-ml307` **2.1.6**, 其 `WebSocket(Transport*)` 与
+> 同步 `Transport` (Send/Receive) 接口。C5 适配层严格按 2.1.6 头文件实现,
+> 不同于 GitHub main 的 `NetworkInterface` 新 API。
+
 ## 待办 / 下一步
 
-- [ ] S3 端 `C5Bridge` 驱动 + `Esp32C5Board`（可继续让我写）
-- [ ] `DualNetworkBoard` 增加 C5 分支
-- [ ] TLS 证书校验开启
-- [ ] 可选：WiFi 配网凭据由 S3 通过 `WIFI_CONFIG` 下发（复用小智现有配网 UI）
+- [ ] TLS 证书校验开启 (C5 侧 bridge_sock.c, 见上文)
+- [ ] 在 IDF 环境实际 `idf.py build` 两端做编译验证与联调
+- [ ] 按硬件实际修改 C5/S3 两侧 UART 引脚

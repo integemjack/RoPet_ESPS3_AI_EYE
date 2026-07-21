@@ -4,12 +4,14 @@
 #include "board.h"
 #include "wifi_board.h"
 #include "ml307_board.h"
+#include "esp32c5_board.h"
 #include <memory>
 
 //enum NetworkType
 enum class NetworkType {
     WIFI,
-    ML307
+    ML307,
+    C5      // 外接 ESP32-C5 WiFi 网桥 (含 5G)
 };
 
 // 双网络板卡类，可以在WiFi和ML307之间切换
