@@ -55,6 +55,27 @@ void Esp32C5Board::WaitForNetworkReady() {
     SyncOtaUrlFromC5();
 }
 
+// 规范化用户在配网页填写的 OTA 地址:
+//  1. 去除首尾空白 (含 \r \n \t 空格)
+//  2. 若地址非空、且不含 query('?')/fragment('#')、且末尾没有 '/', 则自动补 '/'
+//     (小智 OTA 地址是目录形式, 末尾必须带 '/', 用户常漏填)
+static std::string NormalizeOtaUrl(const std::string& raw) {
+    // trim
+    size_t b = raw.find_first_not_of(" \t\r\n");
+    if (b == std::string::npos) return "";
+    size_t e = raw.find_last_not_of(" \t\r\n");
+    std::string url = raw.substr(b, e - b + 1);
+
+    // 带查询参数/锚点的地址不动, 避免破坏 URL 语义
+    if (url.find('?') != std::string::npos || url.find('#') != std::string::npos) {
+        return url;
+    }
+    if (!url.empty() && url.back() != '/') {
+        url += '/';
+    }
+    return url;
+}
+
 void Esp32C5Board::SyncOtaUrlFromC5() {
     // 获取失败(通信超时)就一直重试, 直到 C5 明确返回结果为止。
     // 注意: FetchOtaUrl 返回 true 表示收到有效响应(即使是空串, 代表该机未配置);
@@ -64,13 +85,20 @@ void Esp32C5Board::SyncOtaUrlFromC5() {
     int attempt = 0;
     while (!bridge_.FetchOtaUrl(ota_url, 5000)) {
         attempt++;
-        ESP_LOGW(TAG, "fetch ota_url from C5 timeout, retry #%d ...", attempt);
-        // 长时间取不到多半是 C5 未就绪/接线问题, 给现场一个可见提示
-        if (attempt == 3) {
+        // 探活: 区分"C5 完全没响应(接线/固件问题)"与"C5 活着但 OTA 帧偶发丢失"
+        if (bridge_.PingC5(1000)) {
+            ESP_LOGW(TAG, "ota_url fetch timeout but C5 is ALIVE (PONG ok), "
+                          "likely a dropped frame, retry #%d ...", attempt);
+        } else {
+            ESP_LOGE(TAG, "ota_url fetch timeout and C5 NOT responding to PING, "
+                          "check wiring / C5 firmware. retry #%d ...", attempt);
+            // 无响应多半是 C5 未就绪/接线问题, 给现场一个可见提示
             display->SetStatus(Lang::Strings::REGISTERING_NETWORK);
         }
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
+
+    ota_url = NormalizeOtaUrl(ota_url);
 
     Settings settings("wifi", true);
     if (!ota_url.empty()) {

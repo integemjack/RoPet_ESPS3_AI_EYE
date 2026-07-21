@@ -71,6 +71,10 @@ public:
     void RequestStatus();
     void RequestWifiStart();
 
+    // 探活: 发 PING 等 PONG, 返回 true 表示 C5 活着并响应。
+    // 用于区分"C5 未就绪/接线问题"和"C5 活着但某帧丢失"。
+    bool PingC5(int timeout_ms = 1000);
+
     // 向 C5 请求配网页保存的 OTA 地址并等待返回。
     // 返回 true 且 out_url 有值表示 C5 上配置了地址; 空字符串表示未配置。
     // 超时返回 false。
