@@ -18,9 +18,13 @@ extern "C" {
  * 注意: 交叉连线!  C5.TX -> S3.RX,  C5.RX -> S3.TX
  * 下面是 C5 自己的引脚, 按实际硬件修改。
  */
+// 注意: ESP32-C5 的 GPIO13=USB D-, GPIO14=USB D+, 绝对不能用作 UART,
+//       否则一启动就会掐断 USB(烧录后 esptool/monitor 全部失联)。
+//       flash 相关引脚(通常 GPIO10~17 视封装)也应避开。
+//       这里用 GPIO5(TX)/GPIO6(RX), 与 USB/flash 均不冲突。
 #define BRIDGE_UART_PORT      UART_NUM_1
 #define BRIDGE_UART_TX_PIN    5
-#define BRIDGE_UART_RX_PIN    4
+#define BRIDGE_UART_RX_PIN    6
 #define BRIDGE_UART_BAUD      921600
 #define BRIDGE_UART_BUF_SIZE  8192
 

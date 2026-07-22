@@ -84,11 +84,16 @@ void app_main(void)
     ESP_LOGI(TAG, "ready");
 
     /* C5 自主启动网络: 用 NVS 里存的凭据连; 没有则自动开热点配网 */
+    ESP_LOGI(TAG, "calling bridge_wifi_start() ...");
     bridge_wifi_start();
+    ESP_LOGI(TAG, "bridge_wifi_start() returned");
 
-    /* 周期性上报状态, 让 S3 侧信号图标能刷新 */
+    /* 周期性上报状态 + 始终打印心跳(便于串口诊断) */
+    uint32_t tick = 0;
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(5000));
+        ESP_LOGI(TAG, "heartbeat #%lu, wifi_connected=%d",
+                 (unsigned long)(++tick), (int)bridge_wifi_is_connected());
         if (bridge_wifi_is_connected()) {
             bridge_wifi_report_status();
         }
