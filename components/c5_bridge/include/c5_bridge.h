@@ -41,6 +41,13 @@ public:
     C5Bridge(gpio_num_t tx_pin, gpio_num_t rx_pin, size_t rx_buffer_size = 8192);
     ~C5Bridge();
 
+    // 配置硬件流控引脚 (可选)。需在 Start() 之前调用, 两端都启用才生效。
+    // 接线: S3.RTS -> C5.CTS,  S3.CTS -> C5.RTS。默认禁用 (GPIO_NUM_NC)。
+    void SetFlowControlPins(gpio_num_t rts_pin, gpio_num_t cts_pin) {
+        rts_pin_ = rts_pin;
+        cts_pin_ = cts_pin;
+    }
+
     // 启动 UART + 接收任务, 等待 C5 就绪 (EVT_READY)
     void Start(int baud_rate = 921600);
 
@@ -90,12 +97,17 @@ private:
 
     gpio_num_t   tx_pin_;
     gpio_num_t   rx_pin_;
+    gpio_num_t   rts_pin_ = GPIO_NUM_NC;   // 硬件流控 RTS (可选)
+    gpio_num_t   cts_pin_ = GPIO_NUM_NC;   // 硬件流控 CTS (可选)
     size_t       rx_buffer_size_;
     uart_port_t  uart_port_;
 
     SemaphoreHandle_t tx_lock_ = nullptr;
     EventGroupHandle_t events_ = nullptr;   // ready / wifi-connected 位
     TaskHandle_t rx_task_ = nullptr;
+
+    // 组帧发送缓冲 (受 tx_lock_ 保护): 头 + payload + crc
+    uint8_t tx_frame_[BRIDGE_HEADER_LEN + BRIDGE_MAX_PAYLOAD + BRIDGE_CRC_LEN];
 
     C5Link links_[BRIDGE_MAX_LINKS];
     std::mutex links_mutex_;

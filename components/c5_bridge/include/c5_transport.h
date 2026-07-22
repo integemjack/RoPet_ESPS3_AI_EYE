@@ -31,6 +31,7 @@ private:
     std::mutex mutex_;
     std::condition_variable cv_;
     std::string rx_buffer_;      // 累积从 C5 收到的数据
+    size_t rx_read_pos_ = 0;     // 已消费位置; 用游标代替 erase(0,n) 的 O(n) 搬移
     bool open_done_ = false;
     bool open_ok_ = false;
     bool closed_ = false;        // 远端关闭

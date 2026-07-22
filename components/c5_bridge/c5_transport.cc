@@ -26,6 +26,7 @@ bool C5Transport::Connect(const char* host, int port) {
     open_ok_ = false;
     closed_ = false;
     rx_buffer_.clear();
+    rx_read_pos_ = 0;
 
     bridge_.SetLinkCallbacks(link_id_,
         [this](bool ok, int err) {
@@ -36,6 +37,11 @@ bool C5Transport::Connect(const char* host, int port) {
         },
         [this](const std::string& data) {
             std::lock_guard<std::mutex> lk(mutex_);
+            // 已全部消费时顺便回收空间, 避免 buffer 无限增长
+            if (rx_read_pos_ > 0 && rx_read_pos_ >= rx_buffer_.size()) {
+                rx_buffer_.clear();
+                rx_read_pos_ = 0;
+            }
             rx_buffer_.append(data);
             cv_.notify_all();
         },
@@ -95,12 +101,21 @@ int C5Transport::Send(const char* data, size_t length) {
 // 同步阻塞读: 有数据即返回; 连接关闭返回 0; (WebSocket 在独立线程调用)
 int C5Transport::Receive(char* buffer, size_t bufferSize) {
     std::unique_lock<std::mutex> lk(mutex_);
-    cv_.wait(lk, [this]() { return !rx_buffer_.empty() || closed_ || link_id_ < 0; });
+    cv_.wait(lk, [this]() {
+        return rx_read_pos_ < rx_buffer_.size() || closed_ || link_id_ < 0;
+    });
 
-    if (!rx_buffer_.empty()) {
-        size_t n = std::min(bufferSize, rx_buffer_.size());
-        memcpy(buffer, rx_buffer_.data(), n);
-        rx_buffer_.erase(0, n);
+    size_t avail = rx_buffer_.size() - rx_read_pos_;
+    if (avail > 0) {
+        // 用读游标代替 erase(0,n): 消费时只移动游标, O(1)
+        size_t n = std::min(bufferSize, avail);
+        memcpy(buffer, rx_buffer_.data() + rx_read_pos_, n);
+        rx_read_pos_ += n;
+        // 全部消费完则一次性清空复位
+        if (rx_read_pos_ >= rx_buffer_.size()) {
+            rx_buffer_.clear();
+            rx_read_pos_ = 0;
+        }
         return (int)n;
     }
     // 关闭 / 已断开

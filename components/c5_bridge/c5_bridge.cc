@@ -15,14 +15,10 @@
 #define EV_OTA_URL         BIT2
 #define EV_PONG            BIT3
 
-static uint16_t crc16_ccitt(const uint8_t* data, size_t len, uint16_t crc)
+/* 查表法 CRC16-CCITT, 复用 bridge_protocol.h 中的实现 (与 C5 端一致) */
+static inline uint16_t crc16_ccitt(const uint8_t* data, size_t len, uint16_t crc)
 {
-    for (size_t i = 0; i < len; i++) {
-        crc ^= (uint16_t)data[i] << 8;
-        for (int b = 0; b < 8; b++)
-            crc = (crc & 0x8000) ? (uint16_t)((crc << 1) ^ 0x1021) : (uint16_t)(crc << 1);
-    }
-    return crc;
+    return bridge_crc16_update(crc, data, len);
 }
 
 C5Bridge::C5Bridge(gpio_num_t tx_pin, gpio_num_t rx_pin, size_t rx_buffer_size)
@@ -39,42 +35,51 @@ C5Bridge::~C5Bridge() {
 }
 
 void C5Bridge::Start(int baud_rate) {
+    bool flow_ctrl = (rts_pin_ != GPIO_NUM_NC && cts_pin_ != GPIO_NUM_NC);
+
     uart_config_t cfg = {};
     cfg.baud_rate = baud_rate;
     cfg.data_bits = UART_DATA_8_BITS;
     cfg.parity = UART_PARITY_DISABLE;
     cfg.stop_bits = UART_STOP_BITS_1;
-    cfg.flow_ctrl = UART_HW_FLOWCTRL_DISABLE;
+    cfg.flow_ctrl = flow_ctrl ? UART_HW_FLOWCTRL_CTS_RTS : UART_HW_FLOWCTRL_DISABLE;
+    cfg.rx_flow_ctrl_thresh = 122;   // 剩余空间阈值, 触发 RTS 反压
     cfg.source_clk = UART_SCLK_DEFAULT;
 
     ESP_ERROR_CHECK(uart_driver_install(uart_port_, rx_buffer_size_, rx_buffer_size_, 0, nullptr, 0));
     ESP_ERROR_CHECK(uart_param_config(uart_port_, &cfg));
-    ESP_ERROR_CHECK(uart_set_pin(uart_port_, tx_pin_, rx_pin_, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
+    ESP_ERROR_CHECK(uart_set_pin(uart_port_, tx_pin_, rx_pin_,
+                                 flow_ctrl ? rts_pin_ : UART_PIN_NO_CHANGE,
+                                 flow_ctrl ? cts_pin_ : UART_PIN_NO_CHANGE));
 
     xTaskCreate(RxTaskEntry, "c5_rx", 4096, this, 12, &rx_task_);
-    ESP_LOGI(TAG, "C5Bridge started: tx=%d rx=%d baud=%d", tx_pin_, rx_pin_, baud_rate);
+    ESP_LOGI(TAG, "C5Bridge started: tx=%d rx=%d baud=%d flow_ctrl=%d",
+             tx_pin_, rx_pin_, baud_rate, flow_ctrl ? 1 : 0);
 }
 
 bool C5Bridge::SendFrame(uint8_t type, uint8_t link_id, const uint8_t* payload, uint16_t len) {
     if (len > BRIDGE_MAX_PAYLOAD) return false;
 
-    uint8_t hdr[BRIDGE_HEADER_LEN];
-    hdr[0] = BRIDGE_MAGIC0;
-    hdr[1] = BRIDGE_MAGIC1;
-    hdr[2] = type;
-    hdr[3] = link_id;
-    hdr[4] = (uint8_t)(len & 0xFF);
-    hdr[5] = (uint8_t)(len >> 8);
-
-    uint16_t crc = 0xFFFF;
-    crc = crc16_ccitt(&hdr[2], BRIDGE_HEADER_LEN - 2, crc);
-    if (payload && len) crc = crc16_ccitt(payload, len, crc);
-    uint8_t crc_le[2] = { (uint8_t)(crc & 0xFF), (uint8_t)(crc >> 8) };
-
     xSemaphoreTake(tx_lock_, portMAX_DELAY);
-    uart_write_bytes(uart_port_, (const char*)hdr, BRIDGE_HEADER_LEN);
-    if (payload && len) uart_write_bytes(uart_port_, (const char*)payload, len);
-    uart_write_bytes(uart_port_, (const char*)crc_le, BRIDGE_CRC_LEN);
+
+    // 一次组装整帧再单次写出 (原来 3 次 uart_write_bytes -> 1 次)
+    uint8_t* f = tx_frame_;
+    f[0] = BRIDGE_MAGIC0;
+    f[1] = BRIDGE_MAGIC1;
+    f[2] = type;
+    f[3] = link_id;
+    f[4] = (uint8_t)(len & 0xFF);
+    f[5] = (uint8_t)(len >> 8);
+    if (payload && len) memcpy(&f[BRIDGE_HEADER_LEN], payload, len);
+
+    uint16_t crc = crc16_ccitt(&f[2], BRIDGE_HEADER_LEN - 2, 0xFFFF);
+    if (payload && len) crc = crc16_ccitt(&f[BRIDGE_HEADER_LEN], len, crc);
+    f[BRIDGE_HEADER_LEN + len]     = (uint8_t)(crc & 0xFF);
+    f[BRIDGE_HEADER_LEN + len + 1] = (uint8_t)(crc >> 8);
+
+    int total = BRIDGE_HEADER_LEN + len + BRIDGE_CRC_LEN;
+    uart_write_bytes(uart_port_, (const char*)f, total);
+
     xSemaphoreGive(tx_lock_);
     return true;
 }
@@ -86,41 +91,53 @@ void C5Bridge::RxTaskEntry(void* arg) {
 void C5Bridge::RxTask() {
     enum { ST_M0, ST_M1, ST_TYPE, ST_LINK, ST_L0, ST_L1, ST_PL, ST_C0, ST_C1 } st = ST_M0;
     static uint8_t payload[BRIDGE_MAX_PAYLOAD];
+    static uint8_t rxbuf[512];
     uint8_t type = 0, link = 0;
     uint16_t len = 0, idx = 0, rx_crc = 0;
-    uint8_t byte;
 
     while (true) {
-        int r = uart_read_bytes(uart_port_, &byte, 1, portMAX_DELAY);
-        if (r != 1) continue;
-        switch (st) {
-        case ST_M0: st = (byte == BRIDGE_MAGIC0) ? ST_M1 : ST_M0; break;
-        case ST_M1: st = (byte == BRIDGE_MAGIC1) ? ST_TYPE : ST_M0; break;
-        case ST_TYPE: type = byte; st = ST_LINK; break;
-        case ST_LINK: link = byte; st = ST_L0; break;
-        case ST_L0: len = byte; st = ST_L1; break;
-        case ST_L1:
-            len |= (uint16_t)byte << 8;
-            if (len > BRIDGE_MAX_PAYLOAD) { st = ST_M0; break; }
-            idx = 0; st = (len == 0) ? ST_C0 : ST_PL; break;
-        case ST_PL:
-            payload[idx++] = byte;
-            if (idx >= len) st = ST_C0;
-            break;
-        case ST_C0: rx_crc = byte; st = ST_C1; break;
-        case ST_C1: {
-            rx_crc |= (uint16_t)byte << 8;
-            uint8_t meta[4] = { type, link, (uint8_t)(len & 0xFF), (uint8_t)(len >> 8) };
-            uint16_t crc = crc16_ccitt(meta, 4, 0xFFFF);
-            crc = crc16_ccitt(payload, len, crc);
-            if (crc == rx_crc) {
-                DispatchFrame(type, link, payload, len);
-            } else {
-                ESP_LOGW(TAG, "CRC mismatch type=0x%02x len=%u", type, len);
+        // 批量读取: 一次系统调用拿一批字节, 大幅降低逐字节读的开销
+        int got = uart_read_bytes(uart_port_, rxbuf, sizeof(rxbuf), portMAX_DELAY);
+        if (got <= 0) continue;
+
+        for (int i = 0; i < got; i++) {
+            uint8_t byte = rxbuf[i];
+            switch (st) {
+            case ST_M0: st = (byte == BRIDGE_MAGIC0) ? ST_M1 : ST_M0; break;
+            case ST_M1: st = (byte == BRIDGE_MAGIC1) ? ST_TYPE : ST_M0; break;
+            case ST_TYPE: type = byte; st = ST_LINK; break;
+            case ST_LINK: link = byte; st = ST_L0; break;
+            case ST_L0: len = byte; st = ST_L1; break;
+            case ST_L1:
+                len |= (uint16_t)byte << 8;
+                if (len > BRIDGE_MAX_PAYLOAD) { st = ST_M0; break; }
+                idx = 0; st = (len == 0) ? ST_C0 : ST_PL; break;
+            case ST_PL: {
+                // 批量拷贝当前 buffer 中属于本 payload 的连续字节
+                uint16_t need = len - idx;
+                int avail = got - i;
+                int n = (avail < need) ? avail : need;
+                memcpy(&payload[idx], &rxbuf[i], n);
+                idx += n;
+                i += n - 1;   // for 循环还会 +1
+                if (idx >= len) st = ST_C0;
+                break;
             }
-            st = ST_M0;
-            break;
-        }
+            case ST_C0: rx_crc = byte; st = ST_C1; break;
+            case ST_C1: {
+                rx_crc |= (uint16_t)byte << 8;
+                uint8_t meta[4] = { type, link, (uint8_t)(len & 0xFF), (uint8_t)(len >> 8) };
+                uint16_t crc = crc16_ccitt(meta, 4, 0xFFFF);
+                crc = crc16_ccitt(payload, len, crc);
+                if (crc == rx_crc) {
+                    DispatchFrame(type, link, payload, len);
+                } else {
+                    ESP_LOGW(TAG, "CRC mismatch type=0x%02x len=%u", type, len);
+                }
+                st = ST_M0;
+                break;
+            }
+            }
         }
     }
 }
