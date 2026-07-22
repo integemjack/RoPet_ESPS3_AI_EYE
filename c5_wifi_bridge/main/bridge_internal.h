@@ -21,10 +21,10 @@ extern "C" {
 // 注意: ESP32-C5 的 GPIO13=USB D-, GPIO14=USB D+, 绝对不能用作 UART,
 //       否则一启动就会掐断 USB(烧录后 esptool/monitor 全部失联)。
 //       flash 相关引脚(通常 GPIO10~17 视封装)也应避开。
-//       这里用 GPIO5(TX)/GPIO6(RX), 与 USB/flash 均不冲突。
+//       这里用 GPIO4(TX)/GPIO3(RX), 与 USB/flash 均不冲突。
 #define BRIDGE_UART_PORT      UART_NUM_1
-#define BRIDGE_UART_TX_PIN    5
-#define BRIDGE_UART_RX_PIN    6
+#define BRIDGE_UART_TX_PIN    4
+#define BRIDGE_UART_RX_PIN    3
 #define BRIDGE_UART_BAUD      921600
 #define BRIDGE_UART_BUF_SIZE  8192
 

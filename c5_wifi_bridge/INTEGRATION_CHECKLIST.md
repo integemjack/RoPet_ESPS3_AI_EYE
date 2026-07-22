@@ -14,8 +14,8 @@
 
 | 信号 | C5 GPIO | 宏 |
 |------|---------|-----|
-| UART TX | **GPIO5** | `BRIDGE_UART_TX_PIN` |
-| UART RX | **GPIO6** | `BRIDGE_UART_RX_PIN` |
+| UART TX | **GPIO4** | `BRIDGE_UART_TX_PIN` |
+| UART RX | **GPIO3** | `BRIDGE_UART_RX_PIN` |
 
 > ⚠️ ESP32-C5 的 **GPIO13=USB D-、GPIO14=USB D+**，绝不能用作 UART，否则一启动就掐断 USB（烧录后 esptool/monitor 全部失联、也没热点）。已避开。
 | 端口 | UART_NUM_1 | `BRIDGE_UART_PORT` |
@@ -46,20 +46,19 @@
 ```
    C5                         S3 (doit-esp32s3-eye-8311)
  ┌──────────┐               ┌───────────────────────────┐
- │ TX GPIO5 │──────────────>│ IO48  ML307_RX_PIN (S3 收) │
- │ RX GPIO6 │<──────────────│ IO47  ML307_TX_PIN (S3 发) │
+ │ TX GPIO4 │──────────────>│ IO48  ML307_RX_PIN (S3 收) │
+ │ RX GPIO3 │<──────────────│ IO47  ML307_TX_PIN (S3 发) │
  │ GND      │───────────────│ GND                       │
  │ 3V3      │───────────────│ 3V3                       │
  └──────────┘               └───────────────────────────┘
 ```
 
 > 方向说明：`ML307_RX_PIN`/`ML307_TX_PIN` 是**从 S3 角度**命名的。
-> IO48 是 S3 的**接收**脚（原来接 4G 模组的 TX），所以现在接 C5 的 **TX(GPIO5)**；
-> IO47 是 S3 的**发送**脚（原来接 4G 模组的 RX），所以现在接 C5 的 **RX(GPIO6)**。
-> 你说的"IO48 对应 4G 上的 TX"完全正确 —— IO48 一直是接对端 TX 的那根线。
+> IO48 是 S3 的**接收**脚（原来接 4G 模组的 TX），所以现在接 C5 的 **TX(GPIO4)**；
+> IO47 是 S3 的**发送**脚（原来接 4G 模组的 RX），所以现在接 C5 的 **RX(GPIO3)**。
 
-- [ ] **C5.TX(GPIO5) → S3.IO48(ML307_RX_PIN)**
-- [ ] **C5.RX(GPIO6) → S3.IO47(ML307_TX_PIN)**
+- [ ] **C5.TX(GPIO4) → S3.IO48(ML307_RX_PIN)**
+- [ ] **C5.RX(GPIO3) → S3.IO47(ML307_TX_PIN)**
 - [ ] **GND 共地**（必接，否则通信不稳定）
 - [ ] **供电**：3V3 共用或各自独立供电（独立供电时仍需共地）
 - [ ] **烧录 C5**：`cd c5_wifi_bridge; idf.py -p <C5口> flash monitor`

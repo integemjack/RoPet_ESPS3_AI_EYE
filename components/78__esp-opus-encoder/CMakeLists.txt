@@ -7,4 +7,6 @@ idf_component_register(
         "include"
     PRIV_INCLUDE_DIRS
         "."
+    REQUIRES
+        78__esp-opus
 )

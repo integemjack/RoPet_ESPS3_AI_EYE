@@ -129,7 +129,9 @@ private:
 
 public:
 
-  XiaoZhiEyeBoard() : DualNetworkBoard(ML307_TX_PIN, ML307_RX_PIN, 4096),boot_button_(BOOT_BUTTON_GPIO) {
+  // 第4个参数 default_net_type: 0=WiFi(S3自带) 1=ML307(4G) 2=C5(WiFi网桥,含5G)
+  // 默认走 C5, 开机即用外接 C5 的 5G WiFi
+  XiaoZhiEyeBoard() : DualNetworkBoard(ML307_TX_PIN, ML307_RX_PIN, 4096, 2),boot_button_(BOOT_BUTTON_GPIO) {
     InitializeI2c();
     InitializeButtons();
     touch_init();

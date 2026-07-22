@@ -261,7 +261,9 @@ endif()
 idf_component_register(SRCS ${SOURCES}
                     EMBED_FILES ${LANG_SOUNDS} ${COMMON_SOUNDS}
                     INCLUDE_DIRS ${INCLUDE_DIRS}
-                    REQUIRES c5_bridge
+                    REQUIRES c5_bridge touch_element app_update spi_flash
+                             esp_timer nvs_flash esp_wifi driver esp_lcd
+                             esp_adc esp-tls esp_http_client json efuse vb6824
                     WHOLE_ARCHIVE
                     )
 
