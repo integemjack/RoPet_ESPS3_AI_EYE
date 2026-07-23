@@ -72,6 +72,7 @@ class FlasherApp:
         self.releases = []
         self.detected_chip = None  # 当前选中端口检测到的芯片 (esptool chip 标识)
         self.port_chips = {}       # port -> chip 标识 (None 表示未识别)
+        self.target_manual = False # 用户是否手动选过固件 (手动优先于自动匹配)
         self.probed_ports = set()  # 已完成芯片探测的端口
         # esptool 在进程内调用时会重定向全局 stdout, 必须串行化, 避免并发互相干扰
         self.esptool_lock = threading.Lock()
@@ -89,15 +90,15 @@ class FlasherApp:
         frm = ttk.Frame(self.root)
         frm.pack(fill="x", **pad)
 
-        # 目标选择
-        ttk.Label(frm, text="烧录目标:").grid(row=0, column=0, sticky="w")
+        # 固件 (烧录目标) 选择: 默认按串口芯片自动选, 也可手动选择
+        ttk.Label(frm, text="固件:").grid(row=0, column=0, sticky="w")
         self.target_var = tk.StringVar(value=list(TARGETS.keys())[0])
         self.target_cb = ttk.Combobox(
             frm, textvariable=self.target_var, values=list(TARGETS.keys()),
             state="readonly", width=32,
         )
         self.target_cb.grid(row=0, column=1, sticky="w")
-        self.target_cb.bind("<<ComboboxSelected>>", lambda e: self._update_asset_hint())
+        self.target_cb.bind("<<ComboboxSelected>>", lambda e: self._on_target_picked())
 
         # 版本选择
         ttk.Label(frm, text="版本:").grid(row=1, column=0, sticky="w")
@@ -298,14 +299,48 @@ class FlasherApp:
                     foreground="#a00",
                 )
 
+    def _on_target_picked(self):
+        """用户手动选择固件: 标记为手动 (后续不再被自动匹配覆盖)。"""
+        self.target_manual = True
+        self._update_asset_hint()
+        # 提示手动选择的固件与当前端口芯片是否匹配
+        port = self._port_from_label(self.port_var.get())
+        chip = self.port_chips.get(port)
+        target = TARGETS.get(self.target_var.get())
+        if chip and target and target["chip"] != chip:
+            self.chip_hint.config(
+                text=f"注意: 已手动选择 {target['chip']} 固件, 但 {port} 检测为 "
+                     f"{self.CHIP_DISPLAY.get(chip, chip)}, 烧录前请确认。",
+                foreground="#a00",
+            )
+        else:
+            self.chip_hint.config(
+                text=f"已手动选择固件 [{self.target_var.get()}]", foreground="#666",
+            )
+
     def _on_selected_port_changed(self):
-        """选中的端口变化时, 根据其芯片型号自动选择匹配的固件目标。"""
+        """选中的端口变化时, 根据其芯片型号自动选择匹配的固件目标。
+
+        仅在用户未手动选择固件时执行自动匹配; 手动选择优先。
+        """
         port = self._port_from_label(self.port_var.get())
         chip = getattr(self, "port_chips", {}).get(port)
         self.detected_chip = chip
+
+        # 用户已手动选过固件, 不覆盖, 仅在不匹配时提示
+        if self.target_manual:
+            target = TARGETS.get(self.target_var.get())
+            if chip and target and target["chip"] != chip:
+                self.chip_hint.config(
+                    text=f"注意: 当前固件为 {target['chip']}, 但 {port} 检测为 "
+                         f"{self.CHIP_DISPLAY.get(chip, chip)}, 烧录前请确认。",
+                    foreground="#a00",
+                )
+            return
+
         if not chip:
             self.chip_hint.config(
-                text=f"{port}: 芯片型号未知, 请手动选择固件目标", foreground="#a00",
+                text=f"{port}: 芯片型号未知, 请手动选择固件", foreground="#a00",
             )
             return
 
@@ -313,11 +348,11 @@ class FlasherApp:
         current = TARGETS.get(self.target_var.get())
         if not matching:
             self.chip_hint.config(
-                text=f"检测到 {chip}, 但没有对应的固件目标", foreground="#a00",
+                text=f"检测到 {chip}, 但没有对应的固件", foreground="#a00",
             )
             return
 
-        # 当前所选目标芯片已匹配则保持 (不覆盖用户已选的具体板型)
+        # 当前所选目标芯片已匹配则保持 (不覆盖已选的具体板型)
         if current and current["chip"] == chip:
             selected = self.target_var.get()
         else:
@@ -327,10 +362,10 @@ class FlasherApp:
 
         chip_display = self.CHIP_DISPLAY.get(chip, chip)
         if len(matching) > 1:
-            hint = (f"{port} = {chip_display}, 已选 [{selected}]。"
+            hint = (f"{port} = {chip_display}, 已自动选择 [{selected}]。"
                     f"该芯片有多个板型, 如不符请手动选择。")
         else:
-            hint = f"{port} = {chip_display}, 已选 [{selected}]。"
+            hint = f"{port} = {chip_display}, 已自动选择 [{selected}]。"
         self.chip_hint.config(text=hint, foreground="#080")
 
     # ---------------- Releases ----------------
