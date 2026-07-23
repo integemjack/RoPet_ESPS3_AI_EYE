@@ -17,8 +17,9 @@
 
 static const char *TAG = "Esp32C5Board";
 
-Esp32C5Board::Esp32C5Board(gpio_num_t tx_pin, gpio_num_t rx_pin, size_t rx_buffer_size)
-    : bridge_(tx_pin, rx_pin, rx_buffer_size) {
+Esp32C5Board::Esp32C5Board(gpio_num_t tx_pin, gpio_num_t rx_pin, size_t rx_buffer_size,
+                           gpio_num_t rts_pin, gpio_num_t cts_pin)
+    : bridge_(tx_pin, rx_pin, rx_buffer_size), rts_pin_(rts_pin), cts_pin_(cts_pin) {
 }
 
 std::string Esp32C5Board::GetBoardType() {
@@ -28,6 +29,12 @@ std::string Esp32C5Board::GetBoardType() {
 void Esp32C5Board::StartNetwork() {
     auto display = Board::GetInstance().GetDisplay();
     display->SetStatus(Lang::Strings::DETECTING_MODULE);
+
+    // 若板级配置了流控引脚, 在 Start 前启用 (需 C5 端也启用并接好 RTS/CTS)
+    if (rts_pin_ != GPIO_NUM_NC && cts_pin_ != GPIO_NUM_NC) {
+        bridge_.SetFlowControlPins(rts_pin_, cts_pin_);
+        ESP_LOGI(TAG, "UART flow control enabled: rts=%d cts=%d", rts_pin_, cts_pin_);
+    }
 
     // 启动 UART + 接收任务; C5 上电后会自主连 WiFi / 开热点配网
     bridge_.Start(921600);

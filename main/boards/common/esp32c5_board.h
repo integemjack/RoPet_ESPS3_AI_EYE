@@ -14,8 +14,13 @@ protected:
     void WaitForNetworkReady();
     void SyncOtaUrlFromC5();
 
+    // 硬件流控引脚 (可选, 默认禁用)。填有效 GPIO 且两端都启用才生效。
+    gpio_num_t rts_pin_ = GPIO_NUM_NC;
+    gpio_num_t cts_pin_ = GPIO_NUM_NC;
+
 public:
-    Esp32C5Board(gpio_num_t tx_pin, gpio_num_t rx_pin, size_t rx_buffer_size = 8192);
+    Esp32C5Board(gpio_num_t tx_pin, gpio_num_t rx_pin, size_t rx_buffer_size = 8192,
+                 gpio_num_t rts_pin = GPIO_NUM_NC, gpio_num_t cts_pin = GPIO_NUM_NC);
     virtual std::string GetBoardType() override;
     virtual void StartNetwork() override;
     virtual Http* CreateHttp() override;
