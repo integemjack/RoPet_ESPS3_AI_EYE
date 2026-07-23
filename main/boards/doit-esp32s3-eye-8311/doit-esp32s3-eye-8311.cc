@@ -168,6 +168,11 @@ public:
     
 
     virtual bool GetBatteryLevel(int& level, bool& charging, bool& discharging)  override {
+        // 启动初期 ADC 尚未采集到足够数据，电量仍为初始值 0，
+        // 若此时返回会被上层误判为低电量并播放“电量低”提示音，因此先跳过。
+        if (!power_manager_->IsBatteryLevelReady()) {
+            return false;
+        }
         static bool last_discharging = false;
         charging = power_manager_->IsCharging();
         discharging = power_manager_->IsDischarging();

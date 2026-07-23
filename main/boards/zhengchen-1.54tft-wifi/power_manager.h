@@ -222,6 +222,13 @@ public:
         return battery_level_;
     }
 
+    // 电池电量数据是否已就绪（已采集到足够的 ADC 采样）
+    // 启动初期 ADC 尚未采满，battery_level_ 仍是初始值 0，
+    // 此时不应对外暴露电量，否则会被误判为低电量。
+    bool IsBatteryLevelReady() const {
+        return adc_values_.size() >= kBatteryAdcDataCount;
+    }
+
     float GetTemperature() const { return current_temperature_; }  // 获取当前温度
 
     void OnTemperatureChanged(std::function<void(float)> callback) { 
