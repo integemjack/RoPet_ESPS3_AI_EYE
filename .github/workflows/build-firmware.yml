@@ -1,0 +1,134 @@
+name: Build & Release Firmware
+
+# push 到主分支即自动构建 S3 主固件与 C5 WiFi Bridge 固件 (ESP-IDF v5.5.2),
+# 版本号从根 CMakeLists.txt 的 PROJECT_VER 读取, 自动创建 tag 并发布到 Release,
+# 无需手动打 tag。
+on:
+  push:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.get.outputs.version }}
+      changed: ${{ steps.get.outputs.changed }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Read PROJECT_VER and check tag
+        id: get
+        shell: bash
+        run: |
+          VER=$(grep -oP 'set\(PROJECT_VER\s+"\K[^"]+' CMakeLists.txt)
+          if [ -z "$VER" ]; then
+            echo "无法从 CMakeLists.txt 读取 PROJECT_VER"
+            exit 1
+          fi
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+          echo "Project version: v$VER"
+          # 若 tag v$VER 已存在, 说明版本未变化, 跳过构建与发布
+          if git rev-parse -q --verify "refs/tags/v$VER" >/dev/null; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "tag v$VER 已存在, 版本未变化, 跳过构建。"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "检测到新版本 v$VER, 将构建并发布。"
+          fi
+
+  build:
+    needs: version
+    if: needs.version.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    container:
+      image: espressif/idf:v5.5.2
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ---- S3 主固件 (魔眼) ----
+          - name: doit-esp32s3-eye-6824
+            kind: s3
+            board: doit-esp32s3-eye-6824
+          - name: doit-esp32s3-eye-8311
+            kind: s3
+            board: doit-esp32s3-eye-8311
+          # ---- C5 WiFi Bridge 固件 ----
+          - name: c5-wifi-bridge
+            kind: c5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Build S3 firmware
+        if: matrix.kind == 's3'
+        shell: bash
+        run: |
+          . "$IDF_PATH/export.sh"
+          # build.cfg 提供 -DSDKCONFIG_DEFAULTS 与 -DIDF_TARGET=esp32s3
+          # 内含带引号的参数, 用 eval 让 shell 正确解析
+          BUILD_ARGS=$(cat "main/boards/${{ matrix.board }}/build.cfg")
+          eval "idf.py $BUILD_ARGS -DBOARD_NAME=\"${{ matrix.board }}\" build"
+          eval "idf.py $BUILD_ARGS -DBOARD_NAME=\"${{ matrix.board }}\" merge-bin"
+
+      - name: Build C5 firmware
+        if: matrix.kind == 'c5'
+        shell: bash
+        working-directory: c5_wifi_bridge
+        run: |
+          . "$IDF_PATH/export.sh"
+          idf.py set-target esp32c5
+          idf.py build
+          idf.py merge-bin
+
+      - name: Collect S3 artifact
+        if: matrix.kind == 's3'
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp build/merged-binary.bin "dist/v${{ needs.version.outputs.version }}_${{ matrix.name }}.bin"
+
+      - name: Collect C5 artifact
+        if: matrix.kind == 'c5'
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp c5_wifi_bridge/build/merged-binary.bin "dist/v${{ needs.version.outputs.version }}_${{ matrix.name }}.bin"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-${{ matrix.name }}
+          path: dist/*.bin
+          if-no-files-found: error
+
+  release:
+    needs: [version, build]
+    if: needs.version.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.version.outputs.version }}
+          name: v${{ needs.version.outputs.version }}
+          files: artifacts/*.bin
+          generate_release_notes: true
