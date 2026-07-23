@@ -63,7 +63,9 @@ class FlasherApp:
 
         # releases: list of dict {tag, name, assets:[{name,url}]}
         self.releases = []
-        self.detected_chip = None  # 最近一次检测到的芯片 (esptool chip 标识)
+        self.detected_chip = None  # 当前选中端口检测到的芯片 (esptool chip 标识)
+        self.port_chips = {}       # port -> chip 标识 (None 表示未识别)
+        self.probed_ports = set()  # 已完成芯片探测的端口
         self.log_queue = queue.Queue()
 
         self._build_ui()
@@ -103,8 +105,8 @@ class FlasherApp:
         self.port_var = tk.StringVar()
         self.port_cb = ttk.Combobox(frm, textvariable=self.port_var, values=[], width=32)
         self.port_cb.grid(row=2, column=1, sticky="w")
-        # 选择/刷新串口后自动检测芯片, 据此选中匹配的固件目标
-        self.port_cb.bind("<<ComboboxSelected>>", lambda e: self.detect_chip())
+        # 选择串口后, 根据该端口已识别的芯片自动选中匹配的固件目标
+        self.port_cb.bind("<<ComboboxSelected>>", lambda e: self._on_selected_port_changed())
         ttk.Button(frm, text="刷新串口", command=self.refresh_ports).grid(row=2, column=2, sticky="w")
 
         # 波特率
@@ -115,7 +117,6 @@ class FlasherApp:
             values=["115200", "460800", "921600", "1500000"],
             state="readonly", width=32,
         ).grid(row=3, column=1, sticky="w")
-        ttk.Button(frm, text="检测芯片", command=self.detect_chip).grid(row=3, column=2, sticky="w")
 
         # 芯片检测提示
         self.chip_hint = ttk.Label(frm, text="", foreground="#666")
@@ -161,86 +162,128 @@ class FlasherApp:
         self.root.after(100, self._poll_log)
 
     # ---------------- 串口 ----------------
+    # esptool 输出中的芯片名 -> 对应的 chip 标识
+    CHIP_KEYWORDS = {
+        "ESP32-C5": "esp32c5",
+        "ESP32-S3": "esp32s3",
+    }
+    # chip 标识 -> 友好显示名
+    CHIP_DISPLAY = {
+        "esp32s3": "ESP32-S3",
+        "esp32c5": "ESP32-C5",
+    }
+
+    def _make_port_label(self, port, chip_display):
+        """把端口和芯片名组合成列表显示串, 如 'COM21 - ESP32-S3'。"""
+        return f"{port} - {chip_display}" if chip_display else port
+
+    def _port_from_label(self, label):
+        """从列表显示串反解出真实端口号 (取 ' - ' 前的部分)。"""
+        return label.split(" - ", 1)[0].strip() if label else ""
+
     def refresh_ports(self):
         if list_ports is None:
             self.log("[警告] 未安装 pyserial, 无法枚举串口。请 pip install pyserial")
             return
         ports = [p.device for p in list_ports.comports()]
-        self.port_cb["values"] = ports
-        newly_selected = False
-        if ports and not self.port_var.get():
-            self.port_var.set(ports[0])
-            newly_selected = True
+        # port -> 检测到的 chip 标识 (None 表示未识别)
+        self.port_chips = {p: None for p in ports}
+        self.probed_ports = set()
+        # 先用 "检测中" 占位显示
+        labels = [self._make_port_label(p, "检测中...") for p in ports]
+        self.port_cb["values"] = labels
+        if labels and not self.port_var.get():
+            self.port_var.set(labels[0])
         self.log(f"检测到串口: {', '.join(ports) if ports else '(无)'}")
-        # 刷新后若已有选中的串口, 自动检测芯片
-        if newly_selected or self.port_var.get():
-            self.detect_chip()
-
-    # ---------------- 芯片检测 ----------------
-    # esptool read_chip 输出中的芯片名 -> 对应的 chip 标识
-    CHIP_KEYWORDS = {
-        "ESP32-C5": "esp32c5",
-        "ESP32-S3": "esp32s3",
-    }
-
-    def detect_chip(self):
-        port = self.port_var.get()
-        if not port:
+        if not ports:
+            self.port_cb["values"] = []
+            self.chip_hint.config(text="未检测到串口", foreground="#a00")
             return
-        self.chip_hint.config(text=f"正在检测 {port} 上的芯片 ...", foreground="#666")
-        threading.Thread(target=self._detect_chip_worker, args=(port,), daemon=True).start()
+        self.chip_hint.config(text="正在识别各端口芯片型号 ...", foreground="#666")
+        # 并发探测所有端口
+        for p in ports:
+            threading.Thread(target=self._probe_port, args=(p,), daemon=True).start()
 
-    def _detect_chip_worker(self, port):
+    def _probe_port(self, port):
+        """后台探测单个端口的芯片型号, 完成后更新列表项。"""
         import subprocess
+        chip = None
         try:
-            # 不指定 --chip, 让 esptool 自动识别连接的芯片型号
+            # 不指定 --chip, 让 esptool 自动识别; 低波特率更稳, 超时后跳过
             cmd = [sys.executable, "-m", "esptool", "--port", port, "chip_id"]
-            self.log(f"检测芯片: {' '.join(cmd)}")
             proc = subprocess.run(
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, timeout=30,
+                text=True, timeout=20,
             )
-            out = proc.stdout or ""
-            for line in out.splitlines():
-                self.log(line.rstrip())
-
-            detected = None
-            # esptool 输出形如 "Detecting chip type... ESP32-S3" / "Chip is ESP32-S3 ..."
-            upper = out.upper()
-            for keyword, chip in self.CHIP_KEYWORDS.items():
-                if keyword in upper:
-                    detected = chip
+            out = (proc.stdout or "").upper()
+            for keyword, c in self.CHIP_KEYWORDS.items():
+                if keyword in out:
+                    chip = c
                     break
+        except Exception:
+            chip = None
+        self.root.after(0, lambda: self._on_port_probed(port, chip))
 
-            if detected:
-                self.root.after(0, lambda: self._on_chip_detected(detected, port))
-            else:
-                self.root.after(0, lambda: self.chip_hint.config(
-                    text=f"未能识别 {port} 上的芯片型号 (可尝试重新插拔或按住 BOOT)",
+    def _on_port_probed(self, port, chip):
+        # 端口可能在探测期间已被刷新掉
+        if port not in getattr(self, "port_chips", {}):
+            return
+        self.port_chips[port] = chip
+        chip_display = self.CHIP_DISPLAY.get(chip, "未知芯片")
+        new_label = self._make_port_label(port, chip_display)
+
+        # 更新下拉列表里对应项的文字
+        labels = list(self.port_cb["values"])
+        for i, lbl in enumerate(labels):
+            if self._port_from_label(lbl) == port:
+                # 若该项正被选中, 同步更新选中文本
+                was_selected = (self.port_var.get() == lbl)
+                labels[i] = new_label
+                if was_selected:
+                    self.port_var.set(new_label)
+                break
+        self.port_cb["values"] = labels
+
+        if chip:
+            self.log(f"{port}: 识别为 {chip_display}")
+        else:
+            self.log(f"{port}: 未识别到 ESP 芯片")
+
+        # 若更新的是当前选中端口, 自动匹配固件目标
+        if self._port_from_label(self.port_var.get()) == port:
+            self._on_selected_port_changed()
+
+        # 记录已探测完成的端口
+        self.probed_ports.add(port)
+        # 所有端口都探测完毕后, 若一个都没识别出来给出总提示
+        if self.probed_ports >= set(self.port_chips.keys()):
+            identified = sum(1 for v in self.port_chips.values() if v is not None)
+            if identified == 0 and not self._port_from_label(self.port_var.get()):
+                self.chip_hint.config(
+                    text="未能识别任何端口的芯片 (设备是否已进入烧录模式?)",
                     foreground="#a00",
-                ))
-        except subprocess.TimeoutExpired:
-            self.root.after(0, lambda: self.chip_hint.config(
-                text=f"检测超时: {port} 无响应 (设备是否处于烧录模式?)", foreground="#a00",
-            ))
-        except Exception as e:
-            self.root.after(0, lambda: self.chip_hint.config(
-                text=f"检测失败: {e}", foreground="#a00",
-            ))
+                )
 
-    def _on_chip_detected(self, chip, port):
+    def _on_selected_port_changed(self):
+        """选中的端口变化时, 根据其芯片型号自动选择匹配的固件目标。"""
+        port = self._port_from_label(self.port_var.get())
+        chip = getattr(self, "port_chips", {}).get(port)
         self.detected_chip = chip
-        # 找出当前目标里与检测到的芯片匹配的项
+        if not chip:
+            self.chip_hint.config(
+                text=f"{port}: 芯片型号未知, 请手动选择固件目标", foreground="#a00",
+            )
+            return
+
         matching = [name for name, t in TARGETS.items() if t["chip"] == chip]
         current = TARGETS.get(self.target_var.get())
-
         if not matching:
             self.chip_hint.config(
                 text=f"检测到 {chip}, 但没有对应的固件目标", foreground="#a00",
             )
             return
 
-        # 若当前所选目标芯片已匹配, 保持不变; 否则切到第一个匹配项
+        # 当前所选目标芯片已匹配则保持 (不覆盖用户已选的具体板型)
         if current and current["chip"] == chip:
             selected = self.target_var.get()
         else:
@@ -248,13 +291,13 @@ class FlasherApp:
             self.target_var.set(selected)
             self._update_asset_hint()
 
+        chip_display = self.CHIP_DISPLAY.get(chip, chip)
         if len(matching) > 1:
-            hint = (f"已检测到 {chip} @ {port}, 已切换到 [{selected}]。"
+            hint = (f"{port} = {chip_display}, 已选 [{selected}]。"
                     f"该芯片有多个板型, 如不符请手动选择。")
         else:
-            hint = f"已检测到 {chip} @ {port}, 已选择 [{selected}]。"
+            hint = f"{port} = {chip_display}, 已选 [{selected}]。"
         self.chip_hint.config(text=hint, foreground="#080")
-        self.log(hint)
 
     # ---------------- Releases ----------------
     def refresh_releases(self):
@@ -341,7 +384,7 @@ class FlasherApp:
 
     # ---------------- 烧录 ----------------
     def _validate(self):
-        if not self.port_var.get():
+        if not self._port_from_label(self.port_var.get()):
             messagebox.showwarning("提示", "请先选择串口")
             return False
         return True
@@ -369,7 +412,7 @@ class FlasherApp:
         try:
             target = TARGETS[self.target_var.get()]
             chip = target["chip"]
-            port = self.port_var.get()
+            port = self._port_from_label(self.port_var.get())
             baud = self.baud_var.get()
             path = self._download_asset(asset)
             args = [
@@ -397,12 +440,13 @@ class FlasherApp:
     def _erase_worker(self):
         try:
             target = TARGETS[self.target_var.get()]
+            port = self._port_from_label(self.port_var.get())
             args = [
                 "--chip", target["chip"],
-                "--port", self.port_var.get(),
+                "--port", port,
                 "erase_flash",
             ]
-            self.log(f"开始擦除 {target['chip']} @ {self.port_var.get()} ...")
+            self.log(f"开始擦除 {target['chip']} @ {port} ...")
             self._run_esptool(args)
             self.log("✅ 擦除完成")
         except Exception as e:
