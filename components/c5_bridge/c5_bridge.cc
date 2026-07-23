@@ -96,9 +96,12 @@ void C5Bridge::RxTask() {
     uint16_t len = 0, idx = 0, rx_crc = 0;
 
     while (true) {
-        // 批量读取: 一次系统调用拿一批字节, 大幅降低逐字节读的开销
-        int got = uart_read_bytes(uart_port_, rxbuf, sizeof(rxbuf), portMAX_DELAY);
+        // 批量读取: 先阻塞等 1 字节 (避免凑不满整块而永久阻塞),
+        // 再用 0 超时把 ring buffer 里已到的其余字节一次取走。
+        int got = uart_read_bytes(uart_port_, rxbuf, 1, portMAX_DELAY);
         if (got <= 0) continue;
+        int more = uart_read_bytes(uart_port_, rxbuf + 1, sizeof(rxbuf) - 1, 0);
+        if (more > 0) got += more;
 
         for (int i = 0; i < got; i++) {
             uint8_t byte = rxbuf[i];
