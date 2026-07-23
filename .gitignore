@@ -13,3 +13,7 @@ main/mmap_generate_emoji.h
 .DS_Store
 .cache
 main/mmap_generate_emoji.h
+
+# flasher 打包时由 CI 生成的版本文件
+scripts/flasher/_version.py
+scripts/flasher/__pycache__/

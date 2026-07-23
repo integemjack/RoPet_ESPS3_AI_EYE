@@ -32,7 +32,14 @@ except ImportError:
     list_ports = None
 
 # ---- 配置 ----
-GITHUB_OWNER = "SmartArduino"
+# 打包版本号: CI 打包前会生成 _version.py 写入实际版本 (见 build-firmware.yml),
+# 本地直接运行时该文件不存在, 回退为 "dev"。
+try:
+    from _version import APP_VERSION
+except ImportError:
+    APP_VERSION = "dev"
+
+GITHUB_OWNER = "integemjack"
 GITHUB_REPO = "RoPet_ESPS3_AI_EYE"
 RELEASES_API = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases"
 
@@ -50,7 +57,7 @@ FLASH_BAUD = 921600
 class FlasherApp:
     def __init__(self, root):
         self.root = root
-        root.title("RoPet 固件烧录工具")
+        root.title(f"RoPet 固件烧录工具  v{APP_VERSION}")
         root.geometry("720x560")
         root.minsize(640, 480)
 
@@ -60,6 +67,7 @@ class FlasherApp:
 
         self._build_ui()
         self._poll_log()
+        self.log(f"RoPet 固件烧录工具 v{APP_VERSION}")
         self.refresh_releases()
         self.refresh_ports()
 
