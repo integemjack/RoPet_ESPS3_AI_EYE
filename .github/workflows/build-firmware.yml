@@ -114,8 +114,41 @@ jobs:
           path: dist/*.bin
           if-no-files-found: error
 
+  flasher:
+    needs: version
+    if: needs.version.outputs.changed == 'true'
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r scripts/flasher/requirements.txt pyinstaller
+
+      - name: Build flasher exe
+        shell: bash
+        run: |
+          pyinstaller --noconsole --onefile \
+            --name "RoPet-Flasher-v${{ needs.version.outputs.version }}" \
+            scripts/flasher/flash_gui.py
+
+      - name: Upload flasher artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: flasher-windows
+          path: dist/*.exe
+          if-no-files-found: error
+
   release:
-    needs: [version, build]
+    needs: [version, build, flasher]
     if: needs.version.outputs.changed == 'true'
     runs-on: ubuntu-latest
     steps:
@@ -130,5 +163,7 @@ jobs:
         with:
           tag_name: v${{ needs.version.outputs.version }}
           name: v${{ needs.version.outputs.version }}
-          files: artifacts/*.bin
+          files: |
+            artifacts/*.bin
+            artifacts/*.exe
           generate_release_notes: true
