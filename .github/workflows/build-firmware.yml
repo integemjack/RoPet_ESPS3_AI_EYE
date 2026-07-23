@@ -138,10 +138,12 @@ jobs:
         run: |
           # 将版本号固化进脚本目录, flash_gui.py 会 import _version.APP_VERSION
           echo "APP_VERSION = \"${{ needs.version.outputs.version }}\"" > scripts/flasher/_version.py
+          # esptool 在进程内调用, 需连同其数据文件和动态子模块一起打包 (--collect-all)
           pyinstaller --noconsole --onefile \
             --name "RoPet-Flasher-v${{ needs.version.outputs.version }}" \
             --paths scripts/flasher \
             --hidden-import _version \
+            --collect-all esptool \
             scripts/flasher/flash_gui.py
 
       - name: Upload flasher artifact

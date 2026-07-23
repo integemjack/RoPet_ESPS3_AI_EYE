@@ -15,11 +15,18 @@ RoPet 固件烧录 GUI 工具
 
 import os
 import sys
+import io
+import contextlib
 import threading
 import tempfile
 import queue
 import tkinter as tk
 from tkinter import ttk, messagebox
+
+try:
+    import esptool
+except ImportError:
+    esptool = None
 
 try:
     import requests
@@ -66,6 +73,8 @@ class FlasherApp:
         self.detected_chip = None  # 当前选中端口检测到的芯片 (esptool chip 标识)
         self.port_chips = {}       # port -> chip 标识 (None 表示未识别)
         self.probed_ports = set()  # 已完成芯片探测的端口
+        # esptool 在进程内调用时会重定向全局 stdout, 必须串行化, 避免并发互相干扰
+        self.esptool_lock = threading.Lock()
         self.log_queue = queue.Queue()
 
         self._build_ui()
@@ -200,29 +209,54 @@ class FlasherApp:
             self.chip_hint.config(text="未检测到串口", foreground="#a00")
             return
         self.chip_hint.config(text="正在识别各端口芯片型号 ...", foreground="#666")
-        # 并发探测所有端口
-        for p in ports:
-            threading.Thread(target=self._probe_port, args=(p,), daemon=True).start()
+        # 顺序探测所有端口 (esptool 进程内调用需串行, 不能并发)
+        threading.Thread(target=self._probe_all_ports, args=(ports,), daemon=True).start()
 
-    def _probe_port(self, port):
-        """后台探测单个端口的芯片型号, 完成后更新列表项。"""
-        import subprocess
-        chip = None
+    def _probe_all_ports(self, ports):
+        """在单个后台线程里顺序探测所有端口的芯片型号。"""
+        for port in ports:
+            chip = self._detect_chip_on_port(port)
+            self.root.after(0, lambda p=port, c=chip: self._on_port_probed(p, c))
+
+    def _detect_chip_on_port(self, port):
+        """在进程内调用 esptool 探测某端口芯片型号, 返回 chip 标识或 None。
+
+        注意: 必须进程内调用而非 sys.executable 起子进程 —— 打包成 exe 后
+        sys.executable 指向 exe 本身, 会导致无限重开 GUI 窗口。
+        """
+        if esptool is None:
+            return None
+        # 不指定 --chip, 让 esptool 自动识别
+        argv = ["--port", port, "chip_id"]
         try:
-            # 不指定 --chip, 让 esptool 自动识别; 低波特率更稳, 超时后跳过
-            cmd = [sys.executable, "-m", "esptool", "--port", port, "chip_id"]
-            proc = subprocess.run(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, timeout=20,
-            )
-            out = (proc.stdout or "").upper()
-            for keyword, c in self.CHIP_KEYWORDS.items():
-                if keyword in out:
-                    chip = c
-                    break
+            out = self._invoke_esptool(argv)
         except Exception:
-            chip = None
-        self.root.after(0, lambda: self._on_port_probed(port, chip))
+            return None
+        upper = out.upper()
+        for keyword, c in self.CHIP_KEYWORDS.items():
+            if keyword in upper:
+                return c
+        return None
+
+    def _invoke_esptool(self, argv, echo=False):
+        """进程内调用 esptool.main(argv), 捕获其输出并返回。
+
+        用 esptool_lock 串行化, 因为期间会重定向全局 sys.stdout/stderr。
+        echo=True 时把输出逐行写入日志区。
+        """
+        if esptool is None:
+            raise RuntimeError("未打包 esptool 模块")
+        buf = io.StringIO()
+        with self.esptool_lock:
+            try:
+                with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+                    esptool.main(argv)
+            finally:
+                out = buf.getvalue()
+        if echo:
+            for line in out.splitlines():
+                self.log(line.rstrip())
+        return out
 
     def _on_port_probed(self, port, chip):
         # 端口可能在探测期间已被刷新掉
@@ -455,19 +489,18 @@ class FlasherApp:
             self.root.after(0, lambda: self._set_busy(False))
 
     def _run_esptool(self, args):
-        """调用 esptool。优先用 Python 模块, 逐行输出到日志。"""
-        import subprocess
-        cmd = [sys.executable, "-m", "esptool"] + args
-        self.log("$ " + " ".join(cmd))
-        proc = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, bufsize=1,
-        )
-        for line in proc.stdout:
-            self.log(line.rstrip())
-        proc.wait()
-        if proc.returncode != 0:
-            raise RuntimeError(f"esptool 退出码 {proc.returncode}")
+        """进程内调用 esptool 执行烧录/擦除, 输出写入日志。
+
+        不能用 sys.executable 起子进程 —— 打包成 exe 后 sys.executable 是 exe
+        本身, 会无限重开 GUI 窗口。esptool.main() 出错时会抛异常或 SystemExit。
+        """
+        self.log("$ esptool " + " ".join(args))
+        try:
+            self._invoke_esptool(list(args), echo=True)
+        except SystemExit as e:
+            # esptool 出错时可能调用 sys.exit(非0)
+            if e.code not in (0, None):
+                raise RuntimeError(f"esptool 退出码 {e.code}")
 
     def _set_busy(self, busy):
         state = "disabled" if busy else "normal"
