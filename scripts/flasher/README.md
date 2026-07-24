@@ -7,8 +7,7 @@
 
 - 自动列出 GitHub Release 中的版本 (workflow 产出的 `v{版本}_{板型}.bin`)
 - 目标选择:
-  - 小智主控 (ESP32-S3 / 6824)
-  - 小智主控 (ESP32-S3 / 8311)
+  - 小智主控 (征辰 AI-EYE / ESP32-S3)
   - C5 WiFi Bridge (ESP32-C5)
 - 串口选择 (自动枚举)
 - 波特率选择, 擦除 Flash

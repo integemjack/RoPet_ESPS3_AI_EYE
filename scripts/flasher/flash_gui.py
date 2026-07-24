@@ -51,10 +51,9 @@ GITHUB_REPO = "RoPet_ESPS3_AI_EYE"
 RELEASES_API = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases"
 
 # 目标定义: 显示名 -> (chip, 资产名匹配关键字, 烧录波特率)
-# 资产名形如 v1.7.2_doit-esp32s3-eye-6824.bin / v1.7.2_c5-wifi-bridge.bin
+# 资产名形如 v1.8.5_zhengchen_eye.bin / v1.8.5_c5-wifi-bridge.bin
 TARGETS = {
-    "小智主控 (ESP32-S3 / 6824)": {"chip": "esp32s3", "match": "doit-esp32s3-eye-6824"},
-    "小智主控 (ESP32-S3 / 8311)": {"chip": "esp32s3", "match": "doit-esp32s3-eye-8311"},
+    "小智主控 (征辰 AI-EYE / ESP32-S3)": {"chip": "esp32s3", "match": "zhengchen_eye"},
     "C5 WiFi Bridge (ESP32-C5)": {"chip": "esp32c5", "match": "c5-wifi-bridge"},
 }
 
