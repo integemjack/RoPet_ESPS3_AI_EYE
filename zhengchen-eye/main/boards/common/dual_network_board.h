@@ -4,22 +4,24 @@
 #include "board.h"
 #include "wifi_board.h"
 #include "ml307_board.h"
+#include "esp32c5_board.h"
 #include <memory>
 
 //enum NetworkType
 enum class NetworkType {
     WIFI,
-    ML307
+    ML307,
+    C5      // 外接 ESP32-C5 WiFi 网桥 (含 5G)
 };
 
-// 双网络板卡类，可以在WiFi和ML307之间切换
+// 双网络板卡类，可以在WiFi、ML307(4G)和C5(WiFi网桥,含5G)之间切换
 class DualNetworkBoard : public Board {
 private:
     // 使用基类指针存储当前活动的板卡
     std::unique_ptr<Board> current_board_;
     NetworkType network_type_ = NetworkType::ML307;  // Default to ML307
 
-    // ML307的引脚配置
+    // ML307/C5 共用的 UART 引脚配置 (互斥使用)
     gpio_num_t ml307_tx_pin_;
     gpio_num_t ml307_rx_pin_;
     gpio_num_t ml307_dtr_pin_;
@@ -56,4 +58,4 @@ public:
     virtual std::string GetDeviceStatusJson() override;
 };
 
-#endif // DUAL_NETWORK_BOARD_H 
+#endif // DUAL_NETWORK_BOARD_H
