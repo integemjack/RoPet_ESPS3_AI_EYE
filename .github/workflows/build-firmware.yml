@@ -1,7 +1,7 @@
 name: Build & Release Firmware
 
-# push 到主分支即自动构建 S3 主固件与 C5 WiFi Bridge 固件 (ESP-IDF v5.5.2),
-# 版本号从根 CMakeLists.txt 的 PROJECT_VER 读取, 自动创建 tag 并发布到 Release,
+# push 到主分支即自动构建 zhengchen-eye S3 主固件与 C5 WiFi Bridge 固件 (ESP-IDF v5.5.2),
+# 版本号从 zhengchen-eye/CMakeLists.txt 的 PROJECT_VER 读取, 自动创建 tag 并发布到 Release,
 # 无需手动打 tag。
 on:
   push:
@@ -30,9 +30,10 @@ jobs:
         id: get
         shell: bash
         run: |
-          VER=$(grep -oP 'set\(PROJECT_VER\s+"\K[^"]+' CMakeLists.txt)
+          # 版本号取自 zhengchen-eye 项目 (即本次打包的主项目)
+          VER=$(grep -oP 'set\(PROJECT_VER\s+"\K[^"]+' zhengchen-eye/CMakeLists.txt)
           if [ -z "$VER" ]; then
-            echo "无法从 CMakeLists.txt 读取 PROJECT_VER"
+            echo "无法从 zhengchen-eye/CMakeLists.txt 读取 PROJECT_VER"
             exit 1
           fi
           echo "version=$VER" >> "$GITHUB_OUTPUT"
@@ -56,13 +57,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # ---- S3 主固件 (魔眼) ----
-          - name: doit-esp32s3-eye-6824
+          # ---- zhengchen-eye S3 主固件 (魔眼, 支持 WiFi/4G/C5) ----
+          - name: zhengchen_eye
             kind: s3
-            board: doit-esp32s3-eye-6824
-          - name: doit-esp32s3-eye-8311
-            kind: s3
-            board: doit-esp32s3-eye-8311
+            board: zhengchen_eye
+            board_config: CONFIG_BOARD_TYPE_ZHENGCHEN_EYE
           # ---- C5 WiFi Bridge 固件 ----
           - name: c5-wifi-bridge
             kind: c5
@@ -72,16 +71,23 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Build S3 firmware
+      - name: Build S3 firmware (zhengchen-eye)
         if: matrix.kind == 's3'
         shell: bash
+        working-directory: zhengchen-eye
         run: |
           . "$IDF_PATH/export.sh"
-          # build.cfg 提供 -DSDKCONFIG_DEFAULTS 与 -DIDF_TARGET=esp32s3
-          # 内含带引号的参数, 用 eval 让 shell 正确解析
-          BUILD_ARGS=$(cat "main/boards/${{ matrix.board }}/build.cfg")
-          eval "idf.py $BUILD_ARGS -DBOARD_NAME=\"${{ matrix.board }}\" build"
-          eval "idf.py $BUILD_ARGS -DBOARD_NAME=\"${{ matrix.board }}\" merge-bin"
+          # 与 scripts/release.py 一致: 先 set-target 生成 sdkconfig,
+          # 再按 config.json 追加板级配置 (含 USE_4G_WIFI, 使 C5 网桥路径可用)。
+          idf.py set-target esp32s3
+          {
+            echo ""
+            echo "${{ matrix.board_config }}=y"
+            echo "CONFIG_USE_DEVICE_AEC=y"
+            echo "CONFIG_USE_4G_WIFI=y"
+          } >> sdkconfig
+          idf.py -DBOARD_NAME="${{ matrix.board }}" build
+          idf.py -DBOARD_NAME="${{ matrix.board }}" merge-bin
 
       - name: Build C5 firmware
         if: matrix.kind == 'c5'
@@ -98,7 +104,7 @@ jobs:
         shell: bash
         run: |
           mkdir -p dist
-          cp build/merged-binary.bin "dist/v${{ needs.version.outputs.version }}_${{ matrix.name }}.bin"
+          cp zhengchen-eye/build/merged-binary.bin "dist/v${{ needs.version.outputs.version }}_${{ matrix.name }}.bin"
 
       - name: Collect C5 artifact
         if: matrix.kind == 'c5'
