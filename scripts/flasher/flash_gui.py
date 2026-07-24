@@ -34,8 +34,10 @@ except ImportError:
     requests = None
 
 try:
+    import serial
     import serial.tools.list_ports as list_ports
 except ImportError:
+    serial = None
     list_ports = None
 
 # ---- 配置 ----
@@ -58,6 +60,70 @@ TARGETS = {
 }
 
 FLASH_BAUD = 921600
+# ESP-IDF 默认 console log 波特率 (与烧录波特率不同)
+CONSOLE_BAUD = 115200
+
+
+class SerialConsole:
+    """后台串口监视器: 打开串口, 起线程持续读取并回调输出; 支持写入数据。
+
+    仅负责串口 I/O, 不直接碰 UI; 通过 on_data / on_closed 回调把数据交给上层。
+    """
+
+    def __init__(self, port, baud, on_data, on_closed):
+        self.port = port
+        self.baud = int(baud)
+        self.on_data = on_data          # 收到文本时回调 (str)
+        self.on_closed = on_closed      # 串口异常/关闭时回调 (str reason)
+        self.ser = None
+        self._running = False
+        self._thread = None
+
+    def open(self):
+        if serial is None:
+            raise RuntimeError("未安装 pyserial, 无法打开串口调试")
+        # timeout 用于让读线程能周期性检查退出标志
+        self.ser = serial.Serial(self.port, self.baud, timeout=0.1)
+        self._running = True
+        self._thread = threading.Thread(target=self._read_loop, daemon=True)
+        self._thread.start()
+
+    def _read_loop(self):
+        reason = None
+        try:
+            while self._running:
+                try:
+                    data = self.ser.read(4096)
+                except Exception as e:
+                    reason = str(e)
+                    break
+                if data:
+                    text = data.decode("utf-8", errors="replace")
+                    self.on_data(text)
+        finally:
+            if self._running:
+                # 非正常退出 (设备拔出等)
+                self._running = False
+                self.on_closed(reason or "串口已断开")
+
+    def write(self, data: bytes):
+        if self.ser and self.ser.is_open:
+            self.ser.write(data)
+
+    def close(self):
+        self._running = False
+        t = self._thread
+        if t and t.is_alive() and t is not threading.current_thread():
+            t.join(timeout=1.0)
+        if self.ser:
+            try:
+                self.ser.close()
+            except Exception:
+                pass
+            self.ser = None
+
+    def is_open(self):
+        return self._running and self.ser is not None
 
 
 class FlasherApp:
@@ -77,11 +143,18 @@ class FlasherApp:
         self.esptool_lock = threading.Lock()
         self.log_queue = queue.Queue()
 
+        # 串口调试 (console) 状态
+        self.console = None          # 当前 SerialConsole 实例
+        self.busy = False            # 是否正在烧录/擦除
+
         self._build_ui()
         self._poll_log()
         self.log(f"RoPet 固件烧录工具 v{APP_VERSION}")
         self.refresh_releases()
         self.refresh_ports()
+
+        # 关闭窗口时清理串口资源
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
     # ---------------- UI ----------------
     def _build_ui(self):
@@ -119,7 +192,7 @@ class FlasherApp:
         ttk.Button(frm, text="刷新串口", command=self.refresh_ports).grid(row=2, column=2, sticky="w")
 
         # 波特率
-        ttk.Label(frm, text="波特率:").grid(row=3, column=0, sticky="w")
+        ttk.Label(frm, text="烧录波特率:").grid(row=3, column=0, sticky="w")
         self.baud_var = tk.StringVar(value=str(FLASH_BAUD))
         ttk.Combobox(
             frm, textvariable=self.baud_var,
@@ -127,13 +200,22 @@ class FlasherApp:
             state="readonly", width=32,
         ).grid(row=3, column=1, sticky="w")
 
+        # 串口调试波特率 (console log, 默认 115200)
+        ttk.Label(frm, text="调试波特率:").grid(row=4, column=0, sticky="w")
+        self.console_baud_var = tk.StringVar(value=str(CONSOLE_BAUD))
+        ttk.Combobox(
+            frm, textvariable=self.console_baud_var,
+            values=["74880", "115200", "230400", "460800", "921600"],
+            state="readonly", width=32,
+        ).grid(row=4, column=1, sticky="w")
+
         # 芯片检测提示
         self.chip_hint = ttk.Label(frm, text="", foreground="#666")
-        self.chip_hint.grid(row=4, column=0, columnspan=3, sticky="w")
+        self.chip_hint.grid(row=5, column=0, columnspan=3, sticky="w")
 
         # 资产提示
         self.asset_hint = ttk.Label(frm, text="", foreground="#666")
-        self.asset_hint.grid(row=5, column=0, columnspan=3, sticky="w")
+        self.asset_hint.grid(row=6, column=0, columnspan=3, sticky="w")
 
         frm.columnconfigure(1, weight=1)
 
@@ -144,15 +226,34 @@ class FlasherApp:
         self.flash_btn.pack(side="left")
         self.erase_btn = ttk.Button(btn_frm, text="擦除 Flash", command=self.start_erase)
         self.erase_btn.pack(side="left", padx=8)
+        self.console_btn = ttk.Button(btn_frm, text="打开串口调试", command=self.toggle_console)
+        self.console_btn.pack(side="left")
 
         # 日志
-        log_frm = ttk.LabelFrame(self.root, text="日志")
+        log_frm = ttk.LabelFrame(self.root, text="日志 / 串口输出")
         log_frm.pack(fill="both", expand=True, **pad)
         self.log_text = tk.Text(log_frm, wrap="word", height=16, state="disabled")
         self.log_text.pack(side="left", fill="both", expand=True)
         sb = ttk.Scrollbar(log_frm, command=self.log_text.yview)
         sb.pack(side="right", fill="y")
         self.log_text.config(yscrollcommand=sb.set)
+
+        # 串口发送输入框 (仅在 console 打开时可用)
+        send_frm = ttk.Frame(self.root)
+        send_frm.pack(fill="x", **pad)
+        ttk.Label(send_frm, text="发送:").pack(side="left")
+        self.send_var = tk.StringVar()
+        self.send_entry = ttk.Entry(send_frm, textvariable=self.send_var, state="disabled")
+        self.send_entry.pack(side="left", fill="x", expand=True, padx=6)
+        self.send_entry.bind("<Return>", lambda e: self.send_console())
+        # 行尾结束符选择
+        self.eol_var = tk.StringVar(value="LF")
+        ttk.Combobox(
+            send_frm, textvariable=self.eol_var,
+            values=["LF", "CRLF", "CR", "无"], state="readonly", width=6,
+        ).pack(side="left")
+        self.send_btn = ttk.Button(send_frm, text="发送", command=self.send_console, state="disabled")
+        self.send_btn.pack(side="left", padx=6)
 
     # ---------------- 日志 ----------------
     def log(self, msg):
@@ -194,6 +295,10 @@ class FlasherApp:
         if list_ports is None:
             self.log("[警告] 未安装 pyserial, 无法枚举串口。请 pip install pyserial")
             return
+        # console 打开时串口被占用, 芯片探测(esptool)会失败, 先关闭再刷新
+        if self.console and self.console.is_open():
+            self.log("[提示] 刷新串口需先关闭串口调试")
+            self._console_close()
         ports = [p.device for p in list_ports.comports()]
         # port -> 检测到的 chip 标识 (None 表示未识别)
         self.port_chips = {p: None for p in ports}
@@ -325,6 +430,10 @@ class FlasherApp:
         port = self._port_from_label(self.port_var.get())
         chip = getattr(self, "port_chips", {}).get(port)
         self.detected_chip = chip
+
+        # 若 console 开在另一个端口, 切换端口时关闭它 (避免占用旧端口)
+        if self.console and self.console.is_open() and self.console.port != port:
+            self._console_close()
 
         # 用户已手动选过固件, 不覆盖, 仅在不匹配时提示
         if self.target_manual:
@@ -473,6 +582,10 @@ class FlasherApp:
                 f"{target['chip']}。\n烧录不匹配的固件可能导致设备无法启动。\n\n仍要继续吗?",
             ):
                 return
+        # 烧录前释放串口 (console 与 esptool 互斥); 记录是否需要烧完自动重开
+        self._console_was_open = bool(self.console and self.console.is_open())
+        if self._console_was_open:
+            self._console_close()
         self._set_busy(True)
         threading.Thread(target=self._flash_worker, args=(asset,), daemon=True).start()
 
@@ -492,6 +605,9 @@ class FlasherApp:
             self.log(f"开始烧录 {chip} @ {port} ...")
             self._run_esptool(args)
             self.log("✅ 烧录完成")
+            # 烧录成功后自动打开串口调试, 直接查看启动日志
+            cbaud = self.console_baud_var.get()
+            self.root.after(0, lambda: self._console_open(port, cbaud))
         except Exception as e:
             self.log(f"[错误] 烧录失败: {e}")
         finally:
@@ -502,6 +618,9 @@ class FlasherApp:
             return
         if not messagebox.askyesno("确认", "确定要擦除整个 Flash 吗?"):
             return
+        # 擦除前释放串口 (与 esptool 互斥)
+        if self.console and self.console.is_open():
+            self._console_close()
         self._set_busy(True)
         threading.Thread(target=self._erase_worker, daemon=True).start()
 
@@ -537,9 +656,83 @@ class FlasherApp:
                 raise RuntimeError(f"esptool 退出码 {e.code}")
 
     def _set_busy(self, busy):
+        self.busy = busy
         state = "disabled" if busy else "normal"
         self.flash_btn.config(state=state)
         self.erase_btn.config(state=state)
+        # 烧录/擦除期间禁止手动开关 console (串口被 esptool 占用)
+        self.console_btn.config(state=state)
+
+    # ---------------- 串口调试 (console) ----------------
+    def _console_open(self, port, baud):
+        """打开串口监视器 (幂等: 先关旧的)。成功返回 True。"""
+        if serial is None:
+            self.log("[错误] 未安装 pyserial, 无法打开串口调试")
+            return False
+        self._console_close()
+        try:
+            self.console = SerialConsole(
+                port, baud,
+                on_data=lambda text: self.log_queue.put(text.rstrip("\n")) if text.strip() else None,
+                on_closed=lambda reason: self.root.after(0, lambda: self._on_console_closed(reason)),
+            )
+            self.console.open()
+        except Exception as e:
+            self.log(f"[错误] 打开串口失败: {e}")
+            self.console = None
+            return False
+        self.log(f"===== 串口调试已打开 {port} @ {baud} =====")
+        self.console_btn.config(text="关闭串口调试")
+        self.send_entry.config(state="normal")
+        self.send_btn.config(state="normal")
+        return True
+
+    def _console_close(self):
+        """关闭当前串口监视器 (若有)。"""
+        if self.console:
+            self.console.close()
+            self.console = None
+            self.log("===== 串口调试已关闭 =====")
+        self.console_btn.config(text="打开串口调试")
+        self.send_entry.config(state="disabled")
+        self.send_btn.config(state="disabled")
+
+    def _on_console_closed(self, reason):
+        """串口被动断开 (设备拔出等) 时的回调。"""
+        self.log(f"[串口] {reason}")
+        self.console = None
+        self.console_btn.config(text="打开串口调试")
+        self.send_entry.config(state="disabled")
+        self.send_btn.config(state="disabled")
+
+    def toggle_console(self):
+        if self.busy:
+            return
+        if self.console and self.console.is_open():
+            self._console_close()
+            return
+        port = self._port_from_label(self.port_var.get())
+        if not port:
+            messagebox.showwarning("提示", "请先选择串口")
+            return
+        self._console_open(port, self.console_baud_var.get())
+
+    def send_console(self):
+        if not (self.console and self.console.is_open()):
+            return
+        text = self.send_var.get()
+        eol = {"LF": "\n", "CRLF": "\r\n", "CR": "\r", "无": ""}.get(self.eol_var.get(), "\n")
+        try:
+            self.console.write((text + eol).encode("utf-8"))
+            self.log(f">>> {text}")
+            self.send_var.set("")
+        except Exception as e:
+            self.log(f"[错误] 发送失败: {e}")
+
+    def on_close(self):
+        """窗口关闭: 清理串口线程与句柄。"""
+        self._console_close()
+        self.root.destroy()
 
 
 def main():
