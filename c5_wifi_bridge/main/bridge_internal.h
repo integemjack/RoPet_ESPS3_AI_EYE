@@ -23,8 +23,8 @@ extern "C" {
 //       flash 相关引脚(通常 GPIO10~17 视封装)也应避开。
 //       这里用 GPIO4(TX)/GPIO3(RX), 与 USB/flash 均不冲突。
 #define BRIDGE_UART_PORT      UART_NUM_1
-#define BRIDGE_UART_TX_PIN    4
-#define BRIDGE_UART_RX_PIN    3
+#define BRIDGE_UART_TX_PIN    9
+#define BRIDGE_UART_RX_PIN    10
 /* 硬件流控 (可选): 设为 -1 (UART_PIN_NO_CHANGE) 表示禁用。
  * 高波特率下强烈建议接上 RTS/CTS 以杜绝 ring buffer 溢出丢帧。
  * 接线: C5.RTS -> S3.CTS,  C5.CTS -> S3.RTS。两端都要启用才生效。 */
