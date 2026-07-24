@@ -272,7 +272,7 @@ private:
     }
 
 public:
-    zhengchen_eye() : DualNetworkBoard(ML307_TX_PIN, ML307_RX_PIN),
+    zhengchen_eye() : DualNetworkBoard(ML307_TX_PIN, ML307_RX_PIN, GPIO_NUM_NC, 2),  // 默认使用 C5 (WiFi网桥,含5G)
         boot_button_(BOOT_BUTTON_GPIO){
         InitializePowerManager();
         InitializePowerSaveTimer();
