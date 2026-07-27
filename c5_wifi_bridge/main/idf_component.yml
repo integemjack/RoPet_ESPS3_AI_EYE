@@ -2,6 +2,14 @@
 ## 直接复用小智同款配网组件, 保证配网网页与小智完全一致
 dependencies:
   idf: '>=5.3'
-  # 与主工程 (S3) 保持同一版本, 保证配网网页/API 完全一致 (该版本为单例 GetInstance API)。
-  # 若要配网扫描页支持显示 5G AP 列表, 可升级到 3.x, 但需把 bridge_wifi.cc 改为实例化(非单例)写法。
-  78/esp-wifi-connect: '~2.4.2'
+  # 与主工程 (S3) 保持同一版本 (2.4.3), 保证配网网页/API 完全一致。
+  #
+  # override_path: 指向本地 vendor 副本 components/esp-wifi-connect。
+  # 原因: C5 双频 (2.4G + 5G) 场景需要修改组件本身的两处行为, 上游没有开关:
+  #   1. StartAccessPoint() 写死 WIFI_BAND_MODE_2G_ONLY, 导致 5G AP 扫不到也连不上
+  #   2. ConnectToWifi() 收到首个 STA_DISCONNECTED 就判定失败, 而 2.4G/5G 同名时
+  #      驱动会先试 2.4G 失败、再切 5G 成功, 慢约 1.8s, 被误判为连接失败
+  # 放在 components/ 下可纳入版本控制, 组件管理器不会再覆盖, CI 与本地一致。
+  78/esp-wifi-connect:
+    version: '~2.4.2'
+    override_path: '../components/esp-wifi-connect'

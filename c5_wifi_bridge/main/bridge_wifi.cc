@@ -33,39 +33,17 @@ static const char *TAG = "bridge_wifi";
 
 static bool s_config_mode = false;
 
-/* C5 是双频单射频。把频段模式打开到 2.4G + 5G, 否则:
- *   - 扫描只返回 2.4G 的 AP, 配网网页列表里永远看不到 5G SSID
- *   - 连接 5G SSID 时驱动只能在 1~13 信道落点, auth 立刻失败 (auth -> init)
- * esp-wifi-connect 2.4.3 的 WifiConfigurationAp::StartAccessPoint() 末尾会写死
- * WIFI_BAND_MODE_2G_ONLY, 所以必须在它 Start() 之后再覆盖一次。 */
-static void bridge_wifi_enable_dual_band(void)
+/* 回读一次频段模式, 确认 2.4G + 5G 已生效 (纯诊断用, 不改变行为)。
+ * 频段模式与国家码的设置已下沉到 components/esp-wifi-connect 内部
+ * (WifiConfigurationAp::StartAccessPoint 与 WifiStation::Start), 那里才是
+ * esp_wifi_start() 之后的正确时机。 */
+static void bridge_wifi_log_band_mode(void)
 {
 #if CONFIG_SOC_WIFI_SUPPORT_5G
-    /* 国家码: 设备会在不同国家销售/使用, 不能写死。
-     * "01" = world safe mode, 配合 ieee80211d_enabled=true, 驱动会读取所连 AP
-     * 信标里的 country IE 并采用路由器所在国的信道规则 (断开后退回 "01")。
-     * 这也是 IDF 的默认值, 但国家码会被持久化到 flash, 显式设一次可以覆盖掉
-     * 早期固件可能写入的错误值。
-     * 注意: 必须用 esp_wifi_set_country_code, 而不是 esp_wifi_set_country ——
-     * 后者不校验各国规则, IDF 头文件明确不推荐。 */
-    esp_err_t err = esp_wifi_set_country_code("01", true);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "set_country_code failed: %s", esp_err_to_name(err));
+    wifi_band_mode_t mode = WIFI_BAND_MODE_2G_ONLY;
+    if (esp_wifi_get_band_mode(&mode) == ESP_OK) {
+        ESP_LOGI(TAG, "band mode = %d (3 = 2.4G + 5G)", (int)mode);
     }
-
-    err = esp_wifi_set_band_mode(WIFI_BAND_MODE_AUTO);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "set_band_mode(AUTO) failed: %s", esp_err_to_name(err));
-        return;
-    }
-    ESP_LOGI(TAG, "band mode = AUTO (2.4G + 5G)");
-
-    /* 组件在 Start() 里已经发起过一次 2.4G-only 扫描, 结果里没有 5G AP。
-     * 这里重扫一次, 让配网页第一次打开就能看到 5G SSID。
-     * 若上一次扫描仍在进行会返回 ESP_ERR_WIFI_STATE, 忽略即可 —— 组件的
-     * 周期性扫描定时器 (10s) 之后会用新频段模式补上。 */
-    esp_wifi_scan_stop();
-    esp_wifi_scan_start(nullptr, false);
 #endif
 }
 
@@ -102,11 +80,7 @@ static void enter_config_mode()
     // 无需额外开关。用户填写后会存入 C5 NVS 的 wifi.ota_url。
     wifi_ap.Start();
 
-    /* 必须放在 Start() 之后: 组件内部刚把频段锁成 2G_ONLY, 这里改回双频,
-     * 这样配网页的扫描列表能出现 5G SSID, 且提交后能真正连上 5G。
-     * 副作用: STA 连上 5G 时, 单射频的 SoftAP 会跟着切到 5G 信道,
-     *        手机会短暂掉线一次 —— 这是 C5 硬件约束, 属预期行为。 */
-    bridge_wifi_enable_dual_band();
+    bridge_wifi_log_band_mode();
 
     bridge_log("C5 WiFi config mode. hotspot: %s url: %s",
                wifi_ap.GetSsid().c_str(), wifi_ap.GetWebServerUrl().c_str());
@@ -136,11 +110,7 @@ extern "C" void bridge_wifi_start(void)
     });
     wifi_station.Start();
 
-    /* WifiStation::Start() 里没有设置频段/国家码, 默认可能只跑 2.4G。
-     * 在 esp_wifi_start() 之后立刻打开双频, 让首次扫描就能看到 5G AP。
-     * 组件在 WIFI_EVENT_STA_START 里已经发起过一次扫描, 这里重扫以确保
-     * 扫描结果覆盖 5G 信道。 */
-    bridge_wifi_enable_dual_band();
+    bridge_wifi_log_band_mode();
 
     /* 等待连接; 失败则进配网 (逻辑同 WifiBoard::StartNetwork) */
     if (!wifi_station.WaitForConnected(60 * 1000)) {
