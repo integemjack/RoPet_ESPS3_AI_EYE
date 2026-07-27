@@ -363,6 +363,15 @@ class FlasherApp:
         "esp32c5": "ESP32-C5",
     }
 
+    # Espressif 官方 USB VID。内置 USB-Serial-JTAG 的芯片 (S3/C3/C5/C6...)
+    # 会直接以该 VID 出现, PID 0x1001 为 USB-Serial-JTAG。
+    ESPRESSIF_VID = 0x303A
+    # 常见 USB-UART 桥接芯片的 VID (CP210x / CH34x / FTDI / PL2303)
+    # 这些板子需要真正握手才能确定芯片型号。
+    UART_BRIDGE_VIDS = {0x10C4, 0x1A86, 0x0403, 0x067B}
+    # 明显不是 ESP 设备的端口描述关键字 (蓝牙虚拟串口等), 直接跳过探测
+    SKIP_DESC_KEYWORDS = ("蓝牙", "bluetooth", "标准串行", "通信端口", "communications port")
+
     def _make_port_label(self, port, chip_display):
         """把端口和芯片名组合成列表显示串, 如 'COM21 - ESP32-S3'。"""
         return f"{port} - {chip_display}" if chip_display else port
@@ -379,48 +388,113 @@ class FlasherApp:
         if self.console and self.console.is_open():
             self.log("[提示] 刷新串口需先关闭串口调试")
             self._console_close()
-        ports = [p.device for p in list_ports.comports()]
+        infos = list(list_ports.comports())
+        ports = [p.device for p in infos]
         # port -> 检测到的 chip 标识 (None 表示未识别)
         self.port_chips = {p: None for p in ports}
         self.probed_ports = set()
-        # 先用 "检测中" 占位显示
-        labels = [self._make_port_label(p, "检测中...") for p in ports]
-        self.port_cb["values"] = labels
-        if labels and not self.port_var.get():
-            self.port_var.set(labels[0])
+
         self.log(f"检测到串口: {', '.join(ports) if ports else '(无)'}")
         if not ports:
             self.port_cb["values"] = []
             self.chip_hint.config(text="未检测到串口", foreground="#a00")
             return
-        self.chip_hint.config(text="正在识别各端口芯片型号 ...", foreground="#666")
-        # 顺序探测所有端口 (esptool 进程内调用需串行, 不能并发)
-        threading.Thread(target=self._probe_all_ports, args=(ports,), daemon=True).start()
+
+        # ---- 第一轮: 按 USB VID/PID 与描述做零成本快速判定 ----
+        # 目的: 避免对蓝牙虚拟串口等做昂贵的 esptool 握手 (每个要等好几秒)
+        need_probe = []      # 需要真正握手探测的端口
+        labels = []
+        for info in infos:
+            port = info.device
+            vid = info.vid
+            desc = (info.description or "")
+            desc_l = desc.lower()
+
+            if vid == self.ESPRESSIF_VID:
+                # Espressif 原生 USB: 无需握手即可确定厂商, 但具体型号仍需握手,
+                # 先标 "Espressif" 并加入探测队列 (优先探测)。
+                need_probe.insert(0, port)
+                labels.append(self._make_port_label(port, "Espressif 检测中..."))
+            elif vid in self.UART_BRIDGE_VIDS:
+                # USB-UART 桥接芯片: 可能接着 ESP, 需要握手
+                need_probe.append(port)
+                labels.append(self._make_port_label(port, "检测中..."))
+            elif vid is None and any(k in desc_l or k in desc for k in self.SKIP_DESC_KEYWORDS):
+                # 蓝牙/板载通信端口: 明确跳过, 不做握手
+                self.port_chips[port] = None
+                self.probed_ports.add(port)
+                labels.append(self._make_port_label(port, "非 ESP 设备"))
+            else:
+                need_probe.append(port)
+                labels.append(self._make_port_label(port, "检测中..."))
+
+        self.port_cb["values"] = labels
+        if labels and not self.port_var.get():
+            # 默认选中第一个待探测(最可能是 ESP)的端口
+            prefer = need_probe[0] if need_probe else None
+            pick = next((l for l in labels if self._port_from_label(l) == prefer), labels[0])
+            self.port_var.set(pick)
+
+        skipped = len(ports) - len(need_probe)
+        if skipped:
+            self.log(f"跳过 {skipped} 个明显非 ESP 的端口 (蓝牙/板载串口)")
+        if not need_probe:
+            self.chip_hint.config(text="未发现可能的 ESP 设备端口", foreground="#a00")
+            return
+
+        self.chip_hint.config(
+            text=f"正在并行识别 {len(need_probe)} 个端口的芯片型号 ...", foreground="#666")
+        # ---- 第二轮: 并行握手探测 (每个端口一个线程, 独立串口互不干扰) ----
+        threading.Thread(target=self._probe_all_ports, args=(need_probe,), daemon=True).start()
 
     def _probe_all_ports(self, ports):
-        """在单个后台线程里顺序探测所有端口的芯片型号。"""
+        """并行探测多个端口的芯片型号。
+
+        用 esptool.detect_chip() 而非 esptool.main(["chip_id"]):
+          - 不经过 argparse / 不重定向全局 stdout, 因此**可以并发**
+          - connect_attempts=1 避免默认 7 次重试拖慢无设备的端口
+        """
+        threads = []
         for port in ports:
-            chip = self._detect_chip_on_port(port)
-            self.root.after(0, lambda p=port, c=chip: self._on_port_probed(p, c))
+            t = threading.Thread(target=self._probe_one_port, args=(port,), daemon=True)
+            t.start()
+            threads.append(t)
+        for t in threads:
+            t.join()
+
+    def _probe_one_port(self, port):
+        chip = self._detect_chip_on_port(port)
+        self.root.after(0, lambda p=port, c=chip: self._on_port_probed(p, c))
 
     def _detect_chip_on_port(self, port):
-        """在进程内调用 esptool 探测某端口芯片型号, 返回 chip 标识或 None。
+        """探测某端口的芯片型号, 返回 chip 标识 (如 'esp32s3') 或 None。
 
+        用 esptool.detect_chip() 直连底层, 相比 esptool.main(["chip_id"]):
+          - 不重定向全局 stdout, 可并发调用 (无需 esptool_lock 串行化)
+          - connect_attempts=1: 默认是 7 次重试, 对没有 ESP 的端口会白等很久
+          - 探完立刻关串口, 不做 chip_id 之外的额外读取
         注意: 必须进程内调用而非 sys.executable 起子进程 —— 打包成 exe 后
         sys.executable 指向 exe 本身, 会导致无限重开 GUI 窗口。
         """
         if esptool is None:
             return None
-        # 不指定 --chip, 让 esptool 自动识别
-        argv = ["--port", port, "chip_id"]
+        esp = None
         try:
-            out = self._invoke_esptool(argv)
+            # 探测阶段用标准 115200 即可, 只需握手不传数据
+            esp = esptool.detect_chip(port=port, baud=115200, connect_attempts=1)
+            name = (esp.CHIP_NAME or "").upper()
         except Exception:
             return None
-        upper = out.upper()
+        finally:
+            if esp is not None:
+                try:
+                    esp._port.close()
+                except Exception:
+                    pass
         for keyword, c in self.CHIP_KEYWORDS.items():
-            if keyword in upper:
+            if keyword in name:
                 return c
+        # 识别到 ESP 芯片但不在支持列表内, 仍返回 None (无匹配固件)
         return None
 
     def _invoke_esptool(self, argv, echo=False):
