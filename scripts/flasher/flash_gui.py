@@ -17,6 +17,38 @@ import os
 import sys
 import io
 import contextlib
+
+
+def _ensure_std_streams():
+    """确保 sys.stdout / sys.stderr 不为 None。
+
+    PyInstaller 以 --noconsole (--windowed) 打包时进程没有控制台,
+    sys.stdout / sys.stderr 均为 None。esptool 内部大量使用 print(),
+    此时会抛 AttributeError: 'NoneType' object has no attribute 'write',
+    导致芯片探测等功能在 exe 里静默失败 (本地带控制台运行却正常)。
+
+    这里在最早期用一个丢弃型流兜底, 保证第三方库的 print 永远有处可写。
+    """
+    class _NullWriter(io.TextIOBase):
+        def write(self, s):
+            return len(s) if s else 0
+
+        def flush(self):
+            pass
+
+        def isatty(self):
+            return False
+
+    for name in ("stdout", "stderr"):
+        if getattr(sys, name, None) is None:
+            setattr(sys, name, _NullWriter())
+    # __stdout__/__stderr__ 也可能为 None, 某些库会直接引用它们
+    for name in ("__stdout__", "__stderr__"):
+        if getattr(sys, name, None) is None:
+            setattr(sys, name, getattr(sys, name.strip("_")))
+
+
+_ensure_std_streams()
 import threading
 import tempfile
 import queue
@@ -479,11 +511,17 @@ class FlasherApp:
         if esptool is None:
             return None
         esp = None
+        name = ""
         try:
+            # detect_chip 内部会 print()/flush(), 依赖 sys.stdout 非 None。
+            # noconsole 打包时由模块顶部的 _ensure_std_streams() 兜底,
+            # 这里不做 redirect_stdout —— 那会改全局流, 并发探测互相干扰。
             # 探测阶段用标准 115200 即可, 只需握手不传数据
             esp = esptool.detect_chip(port=port, baud=115200, connect_attempts=1)
             name = (esp.CHIP_NAME or "").upper()
-        except Exception:
+        except Exception as e:
+            # 记录真实原因, 避免"未识别到 ESP 芯片"掩盖环境问题 (如 exe 无 stdout)
+            self.log(f"[调试] {port} 探测失败: {type(e).__name__}: {e}")
             return None
         finally:
             if esp is not None:
@@ -494,6 +532,8 @@ class FlasherApp:
         for keyword, c in self.CHIP_KEYWORDS.items():
             if keyword in name:
                 return c
+        if name:
+            self.log(f"[调试] {port} 识别为 {name} (无对应固件)")
         # 识别到 ESP 芯片但不在支持列表内, 仍返回 None (无匹配固件)
         return None
 
