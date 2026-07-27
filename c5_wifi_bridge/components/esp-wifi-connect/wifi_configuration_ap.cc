@@ -1,6 +1,7 @@
 #include "wifi_configuration_ap.h"
 #include <cstdio>
 #include <memory>
+#include <algorithm>
 #include <freertos/FreeRTOS.h>
 #include <freertos/event_groups.h>
 #include <esp_err.h>
@@ -81,13 +82,13 @@ void WifiConfigurationAp::Start()
     StartWebServer();
     
     // Start scan immediately
-    esp_wifi_scan_start(nullptr, false);
+    StartScan();
     // Setup periodic WiFi scan timer
     esp_timer_create_args_t timer_args = {
         .callback = [](void* arg) {
             auto* self = static_cast<WifiConfigurationAp*>(arg);
             if (!self->is_connecting_) {
-                esp_wifi_scan_start(nullptr, false);
+                self->StartScan();
             }
         },
         .arg = this,
@@ -96,6 +97,35 @@ void WifiConfigurationAp::Start()
         .skip_unhandled_events = true
     };
     ESP_ERROR_CHECK(esp_timer_create(&timer_args, &scan_timer_));
+}
+
+// [本地修改] 只扫 5GHz。
+// 本产品固定使用 5G 频段, 2.4G 的结果只会让配网列表变长、让用户误选到连不上的
+// 2.4G SSID (双频同名时尤其容易踩)。用 channel_bitmap 把扫描限制在 5G 信道:
+// 注意 channel 必须为 0 才会启用 bitmap, 且实际扫描的信道还会被国家码过滤
+// (我们设的是 "01" world safe mode, 跟随 AP 的 country IE)。
+void WifiConfigurationAp::StartScan()
+{
+#ifdef CONFIG_SOC_WIFI_SUPPORT_5G
+    wifi_scan_config_t scan_config = {};
+    scan_config.channel = 0;   // 0 = 允许按 bitmap 扫描
+    scan_config.channel_bitmap.ghz_2_channels = 0;
+    // 覆盖 wifi_5g_channel_bit_t 中全部 5G 信道 (BIT(1) ~ BIT(28))
+    scan_config.channel_bitmap.ghz_5_channels =
+        WIFI_CHANNEL_36  | WIFI_CHANNEL_40  | WIFI_CHANNEL_44  | WIFI_CHANNEL_48  |
+        WIFI_CHANNEL_52  | WIFI_CHANNEL_56  | WIFI_CHANNEL_60  | WIFI_CHANNEL_64  |
+        WIFI_CHANNEL_100 | WIFI_CHANNEL_104 | WIFI_CHANNEL_108 | WIFI_CHANNEL_112 |
+        WIFI_CHANNEL_116 | WIFI_CHANNEL_120 | WIFI_CHANNEL_124 | WIFI_CHANNEL_128 |
+        WIFI_CHANNEL_132 | WIFI_CHANNEL_136 | WIFI_CHANNEL_140 | WIFI_CHANNEL_144 |
+        WIFI_CHANNEL_149 | WIFI_CHANNEL_153 | WIFI_CHANNEL_157 | WIFI_CHANNEL_161 |
+        WIFI_CHANNEL_165 | WIFI_CHANNEL_169 | WIFI_CHANNEL_173 | WIFI_CHANNEL_177;
+    esp_err_t err = esp_wifi_scan_start(&scan_config, false);
+#else
+    esp_err_t err = esp_wifi_scan_start(nullptr, false);
+#endif
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "scan start failed: %s", esp_err_to_name(err));
+    }
 }
 
 std::string WifiConfigurationAp::GetSsid()
@@ -150,6 +180,12 @@ void WifiConfigurationAp::StartAccessPoint()
     wifi_config.ap.ssid_len = ssid.length();
     wifi_config.ap.max_connection = 4;
     wifi_config.ap.authmode = WIFI_AUTH_OPEN;
+    // 注意: 不要在这里显式指定 ap.channel, 也不要在连接结束后手动改 SoftAP 信道。
+    // C5 单射频, STA 关联 5G 时驱动会把 SoftAP 临时拖到 STA 的信道
+    // ("ap channel adjust"), 但 esp_wifi_disconnect() 之后它会自己把 SoftAP
+    // 带回配置里的信道 —— 热点"掉一下又回来"是正常且能自愈的。
+    // 试图用 esp_wifi_set_channel() 抢先恢复只会让 beacon 与 AP 配置不一致,
+    // 结果热点再也无法被关联。
 
     // Start the WiFi Access Point
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
@@ -378,23 +414,70 @@ void WifiConfigurationAp::StartWebServer()
 
             // 获取当前对象
             auto *this_ = static_cast<WifiConfigurationAp *>(req->user_ctx);
-            if (!this_->ConnectToWifi(ssid_str, password_str)) {
-                cJSON_Delete(json);
-                httpd_resp_send(req, "{\"success\":false,\"error\":\"无法连接到 WiFi\"}", HTTPD_RESP_USE_STRLEN);
+            cJSON_Delete(json);
+
+            // [本地修改] 关键修复: 这里不再同步等待连接结果。
+            //
+            // 原因: C5 单射频。STA 关联 5G AP (ch128) 时驱动会把 SoftAP 也拖到
+            // 同一信道 ("ap channel adjust o:1,1 n:128,2"), 手机的 2.4G 连接
+            // 立刻断开 -> 正在等待的这个 POST /submit 的 TCP 连接被撕掉 ->
+            // 浏览器抛 "Failed to fetch"。设备侧其实连接成功、凭据也存了,
+            // 但用户只看到失败。
+            //
+            // 改成: 立刻回 {"success":true,"pending":true}, 连接放到后台任务,
+            // 网页改为轮询 /submit/status 取结果 (掉线期间轮询失败会自动重试)。
+            if (!this_->StartConnectAsync(ssid_str, password_str)) {
+                httpd_resp_set_type(req, "application/json");
+                httpd_resp_set_hdr(req, "Connection", "close");
+                httpd_resp_send(req, "{\"success\":false,\"error\":\"正在连接中, 请稍候\"}", HTTPD_RESP_USE_STRLEN);
                 return ESP_OK;
             }
 
-            this_->Save(ssid_str, password_str);
-            cJSON_Delete(json);
-            // 设置成功响应
             httpd_resp_set_type(req, "application/json");
+            httpd_resp_set_hdr(req, "Cache-Control", "no-store");
             httpd_resp_set_hdr(req, "Connection", "close");
-            httpd_resp_send(req, "{\"success\":true}", HTTPD_RESP_USE_STRLEN);
+            httpd_resp_send(req, "{\"success\":true,\"pending\":true}", HTTPD_RESP_USE_STRLEN);
             return ESP_OK;
         },
         .user_ctx = this
     };
     ESP_ERROR_CHECK(httpd_register_uri_handler(server_, &form_submit));
+
+    // [本地修改] 连接进度查询接口, 配合上面的异步 /submit。
+    // 网页每秒轮询一次; 因为 SoftAP 可能短暂跟随 STA 换信道导致手机掉线,
+    // 轮询失败不算失败, 网页会一直重试直到拿到 done。
+    httpd_uri_t submit_status = {
+        .uri = "/submit/status",
+        .method = HTTP_GET,
+        .handler = [](httpd_req_t *req) -> esp_err_t {
+            auto *this_ = static_cast<WifiConfigurationAp *>(req->user_ctx);
+            std::string body;
+            {
+                std::lock_guard<std::mutex> lock(this_->connect_mutex_);
+                switch (this_->connect_state_) {
+                case ConnectState::kSuccess:
+                    body = "{\"state\":\"success\"}";
+                    break;
+                case ConnectState::kFailed:
+                    body = "{\"state\":\"failed\",\"error\":\"" + this_->connect_error_ + "\"}";
+                    break;
+                case ConnectState::kConnecting:
+                    body = "{\"state\":\"connecting\"}";
+                    break;
+                default:
+                    body = "{\"state\":\"idle\"}";
+                    break;
+                }
+            }
+            httpd_resp_set_type(req, "application/json");
+            httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+            httpd_resp_set_hdr(req, "Connection", "close");
+            httpd_resp_send(req, body.c_str(), HTTPD_RESP_USE_STRLEN);
+            return ESP_OK;
+        },
+        .user_ctx = this
+    };
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server_, &submit_status));
 
     // Register the done.html page
     httpd_uri_t done_html = {
@@ -630,6 +713,71 @@ void WifiConfigurationAp::StartWebServer()
     ESP_LOGI(TAG, "Web server started");
 }
 
+// [本地修改] 非阻塞地发起连接。HTTP 处理函数立刻返回, 避免 SoftAP 跟随 STA
+// 换信道时把正在等待的 HTTP 连接撕掉 (浏览器 "Failed to fetch")。
+bool WifiConfigurationAp::StartConnectAsync(const std::string &ssid, const std::string &password)
+{
+    {
+        std::lock_guard<std::mutex> lock(connect_mutex_);
+        if (connect_state_ == ConnectState::kConnecting) {
+            return false;   // 已有连接尝试在进行中
+        }
+        connect_state_ = ConnectState::kConnecting;
+        connect_error_.clear();
+        pending_ssid_ = ssid;
+        pending_password_ = password;
+    }
+
+    // 停掉周期扫描定时器, 别在连接期间抢射频。
+    if (scan_timer_) {
+        esp_timer_stop(scan_timer_);
+    }
+
+    if (xTaskCreate(&WifiConfigurationAp::ConnectTask, "wifi_conn", 4096, this, 5, nullptr) != pdPASS) {
+        std::lock_guard<std::mutex> lock(connect_mutex_);
+        connect_state_ = ConnectState::kFailed;
+        connect_error_ = "内存不足";
+        return false;
+    }
+    return true;
+}
+
+void WifiConfigurationAp::ConnectTask(void* arg)
+{
+    auto* self = static_cast<WifiConfigurationAp*>(arg);
+    std::string ssid, password;
+    {
+        std::lock_guard<std::mutex> lock(self->connect_mutex_);
+        ssid = self->pending_ssid_;
+        password = self->pending_password_;
+    }
+
+    bool ok = self->ConnectToWifi(ssid, password);
+    if (ok) {
+        self->Save(ssid, password);
+    }
+
+    // SoftAP 的信道由驱动自行恢复 (ConnectToWifi 内部已 esp_wifi_disconnect),
+    // 这里不要插手, 见 StartAccessPoint 中的说明。
+    {
+        std::lock_guard<std::mutex> lock(self->connect_mutex_);
+        self->connect_state_ = ok ? ConnectState::kSuccess : ConnectState::kFailed;
+        if (!ok) {
+            self->connect_error_ = (self->last_disconnect_reason_ == WIFI_REASON_NO_AP_FOUND)
+                                       ? "找不到该 WiFi"
+                                       : "无法连接到 WiFi, 请检查密码";
+        }
+    }
+
+    // 失败时恢复周期扫描, 让用户能继续选别的 SSID。
+    if (!ok && self->scan_timer_) {
+        esp_timer_start_once(self->scan_timer_, 1000000);
+    }
+    vTaskDelete(nullptr);
+}
+
+// [本地修改] STA 关联 5G 后 SoftAP 会被驱动拖到同一信道, 断开 STA 并不会
+// 自动把 SoftAP 拉回来。这里显式重设一次 AP 配置, 恢复到启动时的信道。
 bool WifiConfigurationAp::ConnectToWifi(const std::string &ssid, const std::string &password)
 {
     if (ssid.empty()) {
@@ -737,7 +885,16 @@ void WifiConfigurationAp::WifiEventHandler(void* arg, esp_event_base_t event_bas
         ESP_LOGW(TAG, "STA disconnected, reason=%d (%s)", reason,
                  fatal ? "fatal" : "retryable, keep waiting");
 
-        if (fatal) {
+        // [本地修改] 只在"正在尝试连接"期间才做重试。
+        //
+        // 之前无条件 esp_wifi_connect(), 于是 ConnectToWifi() 成功后自己调用的
+        // esp_wifi_disconnect() 产生的断连事件 (reason=8 ASSOC_LEAVE) 也会被当成
+        // "可重试", 触发一次新的关联 —— 之后 STA 就无限自我重连。C5 是单射频,
+        // STA 关联会抢走射频时间, SoftAP beacon 发不出去, 手机直接掉线,
+        // 结果就是"凭据已保存但连不上、热点也没了"。
+        if (!self->is_connecting_) {
+            ESP_LOGI(TAG, "not in connecting phase, skip auto reconnect");
+        } else if (fatal) {
             xEventGroupSetBits(self->event_group_, WIFI_FAIL_BIT);
         } else {
             // 驱动在 failure_retry_cnt 用尽后不会自己继续换 BSS, 这里主动重连,
@@ -751,6 +908,15 @@ void WifiConfigurationAp::WifiEventHandler(void* arg, esp_event_base_t event_bas
 
         self->ap_records_.resize(ap_num);
         esp_wifi_scan_get_ap_records(&ap_num, self->ap_records_.data());
+
+#ifdef CONFIG_SOC_WIFI_SUPPORT_5G
+        // [本地修改] 兜底过滤: channel_bitmap 已限定 5G, 但如果驱动/国家码
+        // 仍带回 2.4G 结果 (信道 <= 14), 这里剔除, 保证配网列表只有 5G。
+        self->ap_records_.erase(
+            std::remove_if(self->ap_records_.begin(), self->ap_records_.end(),
+                           [](const wifi_ap_record_t& r) { return r.primary <= 14; }),
+            self->ap_records_.end());
+#endif
 
         // 扫描完成，等待10秒后再次扫描
         esp_timer_start_once(self->scan_timer_, 10 * 1000000);

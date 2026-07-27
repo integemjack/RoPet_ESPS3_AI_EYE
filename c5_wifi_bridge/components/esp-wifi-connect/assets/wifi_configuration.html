@@ -227,7 +227,7 @@
                 new_wifi: '新的 Wi-Fi',
                 password: '密码:',
                 connect: '连接',
-                select_wifi: '从下面列表选择 2.4G Wi-Fi:',
+                select_wifi: '从下面列表选择 5G Wi-Fi:',
                 wifi_tab: 'Wi-Fi 配置',
                 advanced_tab: '高级选项',
                 ota_url: '自定义 OTA 地址:',
@@ -241,7 +241,7 @@
                 new_wifi: '新的 Wi-Fi',
                 password: '密碼:',
                 connect: '連接',
-                select_wifi: '從下方列表選擇 2.4G Wi-Fi:',
+                select_wifi: '從下方列表選擇 5G Wi-Fi:',
                 wifi_tab: 'Wi-Fi 設定',
                 advanced_tab: '進階選項',
                 ota_url: '自定義 OTA 位址:',
@@ -255,7 +255,7 @@
                 new_wifi: 'New Wi-Fi',
                 password: 'Password:',
                 connect: 'Connect',
-                select_wifi: 'Select an 2.4G Wi-Fi from the list below:',
+                select_wifi: 'Select a 5G Wi-Fi from the list below:',
                 wifi_tab: 'Wi-Fi Config',
                 advanced_tab: 'Advanced',
                 ota_url: 'Custom OTA URL:',
@@ -269,7 +269,7 @@
                 new_wifi: '新しいWi-Fi',
                 password: 'パスワード:',
                 connect: '接続',
-                select_wifi: '以下のリストから2.4G Wi-Fiを選択してください:',
+                select_wifi: '以下のリストから5G Wi-Fiを選択してください:',
                 wifi_tab: 'Wi-Fi設定',
                 advanced_tab: '詳細設定',
                 ota_url: '自定義 OTA 位址:',
@@ -483,13 +483,43 @@
                     throw new Error(data.error || '连接失败');
                 }
 
-                // 连接成功，跳转到完成页面
+                // [本地修改] /submit 现在只是"已受理", 真正的结果要轮询。
+                // 设备是单射频: 连接 5G 路由器时热点会短暂跟随换信道, 手机会掉线
+                // 几秒。所以轮询失败不当作失败, 一直重试到拿到最终结果。
+                error.textContent = '正在连接, 请稍候 (手机可能短暂断开热点)...';
+                const ok = await waitForConnectResult();
                 button.disabled = false;
-                window.location.href = '/done.html';
+                if (ok) {
+                    window.location.href = '/done.html';
+                }
             } catch (err) {
                 error.textContent = err.message;
                 button.disabled = false;
             }
+        }
+
+        // [本地修改] 轮询 /submit/status 直到出结果或超时。
+        async function waitForConnectResult() {
+            const deadline = Date.now() + 60000;   // 设备侧最长 15s, 留足掉线重连余量
+            while (Date.now() < deadline) {
+                await new Promise(r => setTimeout(r, 1000));
+                try {
+                    const resp = await fetch('/submit/status', { cache: 'no-store' });
+                    if (!resp.ok) continue;
+                    const st = await resp.json();
+                    if (st.state === 'success') {
+                        return true;
+                    }
+                    if (st.state === 'failed') {
+                        error.textContent = st.error || '连接失败';
+                        return false;
+                    }
+                } catch (e) {
+                    // 热点跟随 STA 换信道导致的临时掉线, 继续重试
+                }
+            }
+            error.textContent = '连接结果未知, 请重新连接热点后重试';
+            return false;
         }
 
         function switchTab(tabName) {
