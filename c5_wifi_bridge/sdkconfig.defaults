@@ -6,8 +6,9 @@ CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
 # UART ISR 放入 IRAM, 高波特率下避免丢字节 (与 S3 侧 ML307 同样的做法)
 CONFIG_UART_ISR_IN_IRAM=y
 
-# 启用 5GHz 频段支持 (C5 双频)
-CONFIG_ESP_WIFI_ENABLE_DUAL_BAND=y
+# 5GHz 支持在 IDF 5.5 里由芯片能力位 CONFIG_SOC_WIFI_SUPPORT_5G 自动给出 (C5=y),
+# 没有 CONFIG_ESP_WIFI_ENABLE_DUAL_BAND 这个选项。运行时频段模式改用
+# esp_wifi_set_band_mode(WIFI_BAND_MODE_AUTO) 设置, 见 main/bridge_wifi.cc。
 
 # mbedTLS: 允许 TLS 客户端, 用于 wss:// / mqtts:// / https://
 CONFIG_MBEDTLS_SSL_PROTO_TLS1_3=y
