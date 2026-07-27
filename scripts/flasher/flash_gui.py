@@ -64,6 +64,61 @@ FLASH_BAUD = 921600
 CONSOLE_BAUD = 115200
 
 
+class _LogStream(io.TextIOBase):
+    """把 esptool 的 stdout/stderr 实时转发到日志区的伪文件对象。
+
+    esptool 的进度是用 '\\r' 覆盖同一行输出的 (如 "Writing at 0x1000... (37 %)"),
+    因此这里同时按 '\\n' 和 '\\r' 切分:
+      - '\\n' 结尾的整行 -> 追加一行
+      - '\\r' 结尾的片段 -> 标记 replace=True, 让 UI 替换上一行 (实现进度原地刷新)
+    同时把所有输出累积到 buffer, 供调用方在结束后取完整文本 (芯片识别用)。
+    """
+
+    def __init__(self, emit):
+        super().__init__()
+        self.emit = emit          # emit(text, replace: bool)
+        self.buffer_all = []      # 完整输出累积
+        self._pending = ""        # 未遇到行结束符的残留
+
+    def write(self, s):
+        if not s:
+            return 0
+        self.buffer_all.append(s)
+        self._pending += s
+        # 依次扫描, 遇到 \n 或 \r 就输出一段
+        while True:
+            idx_n = self._pending.find("\n")
+            idx_r = self._pending.find("\r")
+            if idx_n == -1 and idx_r == -1:
+                break
+            # 取最靠前的结束符
+            if idx_n == -1 or (idx_r != -1 and idx_r < idx_n):
+                seg = self._pending[:idx_r]
+                self._pending = self._pending[idx_r + 1:]
+                # \r 表示原地刷新 (进度)
+                if seg.strip():
+                    self.emit(seg.rstrip(), True)
+            else:
+                seg = self._pending[:idx_n]
+                self._pending = self._pending[idx_n + 1:]
+                if seg.strip():
+                    self.emit(seg.rstrip("\r").rstrip(), False)
+        return len(s)
+
+    def flush(self):
+        # 输出残留 (无结束符的最后一段)
+        if self._pending.strip():
+            self.emit(self._pending.rstrip(), False)
+        self._pending = ""
+
+    def isatty(self):
+        # 让 esptool 认为不是终端, 避免使用 ANSI 控制序列
+        return False
+
+    def getvalue(self):
+        return "".join(self.buffer_all)
+
+
 class SerialConsole:
     """后台串口监视器: 打开串口, 起线程持续读取并回调输出; 支持写入数据。
 
@@ -146,6 +201,8 @@ class FlasherApp:
         # 串口调试 (console) 状态
         self.console = None          # 当前 SerialConsole 实例
         self.busy = False            # 是否正在烧录/擦除
+        # 上一条日志是否为可被覆盖的进度行 (供 _poll_log 原地刷新使用)
+        self._last_line_replaceable = False
 
         self._build_ui()
         self._poll_log()
@@ -260,16 +317,39 @@ class FlasherApp:
         self.log_queue.put(msg)
 
     def _poll_log(self):
+        """从队列取日志写入文本区。
+
+        队列元素可以是:
+          - str            : 普通整行追加
+          - (text, replace): replace=True 时替换最后一行 (用于 esptool 进度原地刷新)
+        """
+        wrote = False
         try:
             while True:
-                msg = self.log_queue.get_nowait()
-                self.log_text.config(state="normal")
-                self.log_text.insert("end", msg + "\n")
-                self.log_text.see("end")
-                self.log_text.config(state="disabled")
+                item = self.log_queue.get_nowait()
+                if isinstance(item, tuple):
+                    text, replace = item
+                else:
+                    text, replace = item, False
+
+                if not wrote:
+                    self.log_text.config(state="normal")
+                    wrote = True
+
+                if replace and self._last_line_replaceable:
+                    # 删除上一行 (进度行), 用新内容替换, 实现原地刷新
+                    self.log_text.delete("end-2l linestart", "end-1c")
+                    self.log_text.insert("end", text + "\n")
+                else:
+                    self.log_text.insert("end", text + "\n")
+                self._last_line_replaceable = replace
         except queue.Empty:
             pass
-        self.root.after(100, self._poll_log)
+        if wrote:
+            self.log_text.see("end")
+            self.log_text.config(state="disabled")
+        # 进度刷新需要较快的响应, 40ms 轮询
+        self.root.after(40, self._poll_log)
 
     # ---------------- 串口 ----------------
     # esptool 输出中的芯片名 -> 对应的 chip 标识
@@ -347,20 +427,25 @@ class FlasherApp:
         """进程内调用 esptool.main(argv), 捕获其输出并返回。
 
         用 esptool_lock 串行化, 因为期间会重定向全局 sys.stdout/stderr。
-        echo=True 时把输出逐行写入日志区。
+        echo=True 时把输出**实时**转发到日志区 (进度行原地刷新)。
         """
         if esptool is None:
             raise RuntimeError("未打包 esptool 模块")
-        buf = io.StringIO()
+        if echo:
+            emit = lambda text, replace: self.log_queue.put((text, replace))
+        else:
+            emit = lambda text, replace: None
+        stream = _LogStream(emit)
         with self.esptool_lock:
             try:
-                with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+                with contextlib.redirect_stdout(stream), contextlib.redirect_stderr(stream):
                     esptool.main(argv)
             finally:
-                out = buf.getvalue()
-        if echo:
-            for line in out.splitlines():
-                self.log(line.rstrip())
+                try:
+                    stream.flush()
+                except Exception:
+                    pass
+                out = stream.getvalue()
         return out
 
     def _on_port_probed(self, port, chip):
