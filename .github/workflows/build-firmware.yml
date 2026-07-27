@@ -121,7 +121,8 @@ jobs:
           if-no-files-found: error
 
   flasher:
-    needs: version
+    # 依赖 build: 需要把两个固件一起打进 exe, 烧录工具运行时无需联网下载
+    needs: [version, build]
     if: needs.version.outputs.changed == 'true'
     runs-on: windows-latest
     steps:
@@ -139,17 +140,38 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r scripts/flasher/requirements.txt pyinstaller
 
+      - name: Download firmware artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: firmware-*
+          path: scripts/flasher/firmware
+          merge-multiple: true
+
+      - name: Verify bundled firmwares
+        shell: bash
+        run: |
+          VER="${{ needs.version.outputs.version }}"
+          ls -l scripts/flasher/firmware
+          for f in "v${VER}_zhengchen_eye.bin" "v${VER}_c5-wifi-bridge.bin"; do
+            if [ ! -f "scripts/flasher/firmware/$f" ]; then
+              echo "缺少内置固件: $f"
+              exit 1
+            fi
+          done
+
       - name: Build flasher exe
         shell: bash
         run: |
           # 将版本号固化进脚本目录, flash_gui.py 会 import _version.APP_VERSION
           echo "APP_VERSION = \"${{ needs.version.outputs.version }}\"" > scripts/flasher/_version.py
           # esptool 在进程内调用, 需连同其数据文件和动态子模块一起打包 (--collect-all)
+          # --add-data 把本版本的 S3 / C5 固件打进 exe (运行时解压到 _MEIPASS/firmware)
           pyinstaller --noconsole --onefile \
             --name "RoPet-Flasher-v${{ needs.version.outputs.version }}" \
             --paths scripts/flasher \
             --hidden-import _version \
             --collect-all esptool \
+            --add-data "scripts/flasher/firmware;firmware" \
             scripts/flasher/flash_gui.py
 
       - name: Upload flasher artifact

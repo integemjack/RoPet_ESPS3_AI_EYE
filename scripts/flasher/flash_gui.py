@@ -4,7 +4,9 @@
 RoPet 固件烧录 GUI 工具
 
 功能:
-  - 从 GitHub Release 拉取版本列表 (workflow 上传的 v{ver}_{board}.bin)
+  - 优先使用**内置固件**: CI 打包时把本版本的 S3 / C5 两个 merged-binary 一起打进 exe,
+    运行时无需联网, 也不再拉取 Release 列表
+  - 未找到内置固件时 (例如本地直接跑脚本) 才回退到 GitHub Release 在线获取
   - 选择目标: 小智主控 (ESP32-S3) 或 C5 WiFi Bridge (ESP32-C5)
   - 选择串口
   - 使用 esptool (与 ESP-IDF v5.5.2 相同的底层烧录器) 将 merged-binary 烧录到 0x0
@@ -94,6 +96,51 @@ TARGETS = {
 FLASH_BAUD = 921600
 # ESP-IDF 默认 console log 波特率 (与烧录波特率不同)
 CONSOLE_BAUD = 115200
+
+# 内置固件所在子目录名 (CI 用 --add-data "xxx.bin;firmware" 打进 exe)
+FIRMWARE_SUBDIR = "firmware"
+
+
+def _bundle_dir():
+    """返回资源所在目录。
+
+    PyInstaller --onefile 运行时资源被解压到 sys._MEIPASS;
+    本地直接跑脚本时就是脚本自身目录。
+    """
+    if getattr(sys, "frozen", False):
+        return getattr(sys, "_MEIPASS", os.path.dirname(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def load_bundled_firmwares():
+    """扫描内置固件, 返回 ({目标显示名: asset}, 版本号)。
+
+    asset 结构与在线 Release 的资产保持一致, 额外带 "path" 字段表示本地文件,
+    这样烧录流程无需区分来源。文件名形如 v1.8.5_zhengchen_eye.bin。
+    """
+    base = _bundle_dir()
+    found = {}
+    version = None
+    # 优先 firmware/ 子目录, 其次与脚本/exe 同级 (方便手工放固件)
+    for d in (os.path.join(base, FIRMWARE_SUBDIR), base):
+        if not os.path.isdir(d):
+            continue
+        for fn in sorted(os.listdir(d)):
+            if not fn.lower().endswith(".bin"):
+                continue
+            path = os.path.join(d, fn)
+            for name, t in TARGETS.items():
+                if t["match"] in fn and name not in found:
+                    found[name] = {
+                        "name": fn,
+                        "path": path,
+                        "size": os.path.getsize(path),
+                    }
+                    if version is None and fn.startswith("v") and "_" in fn:
+                        version = fn.split("_", 1)[0][1:]
+        if found:
+            break
+    return found, version
 
 
 class _LogStream(io.TextIOBase):
@@ -222,6 +269,8 @@ class FlasherApp:
 
         # releases: list of dict {tag, name, assets:[{name,url}]}
         self.releases = []
+        # 内置固件: {目标显示名: asset}; 有内置固件时不再联网取 Release
+        self.bundled, self.bundled_version = load_bundled_firmwares()
         self.detected_chip = None  # 当前选中端口检测到的芯片 (esptool chip 标识)
         self.port_chips = {}       # port -> chip 标识 (None 表示未识别)
         self.target_manual = False # 用户是否手动选过固件 (手动优先于自动匹配)
@@ -239,7 +288,17 @@ class FlasherApp:
         self._build_ui()
         self._poll_log()
         self.log(f"RoPet 固件烧录工具 v{APP_VERSION}")
-        self.refresh_releases()
+        if self.bundled:
+            ver = self.bundled_version or APP_VERSION
+            self.log(f"使用内置固件 (v{ver}), 无需联网:")
+            for name, a in self.bundled.items():
+                self.log(f"  - {a['name']}  ({a['size'] // 1024} KB)")
+            missing = [n for n in TARGETS if n not in self.bundled]
+            if missing:
+                self.log(f"[警告] 缺少内置固件: {', '.join(missing)}")
+            self._set_versions([f"v{ver} (内置)"])
+        else:
+            self.refresh_releases()
         self.refresh_ports()
 
         # 关闭窗口时清理串口资源
@@ -269,7 +328,11 @@ class FlasherApp:
         )
         self.version_cb.grid(row=1, column=1, sticky="w")
         self.version_cb.bind("<<ComboboxSelected>>", lambda e: self._update_asset_hint())
-        ttk.Button(frm, text="刷新版本", command=self.refresh_releases).grid(row=1, column=2, sticky="w")
+        self.refresh_ver_btn = ttk.Button(frm, text="刷新版本", command=self.refresh_releases)
+        self.refresh_ver_btn.grid(row=1, column=2, sticky="w")
+        if self.bundled:
+            # 内置固件模式: 版本固定, 不提供在线刷新
+            self.refresh_ver_btn.state(["disabled"])
 
         # 串口选择
         ttk.Label(frm, text="串口:").grid(row=2, column=0, sticky="w")
@@ -677,6 +740,9 @@ class FlasherApp:
 
     # ---------------- Releases ----------------
     def refresh_releases(self):
+        if self.bundled:
+            self.log("[提示] 当前使用内置固件, 无需获取在线版本")
+            return
         if requests is None:
             self.log("[错误] 未安装 requests, 无法获取 Release。请 pip install requests")
             return
@@ -718,7 +784,12 @@ class FlasherApp:
         self._update_asset_hint()
 
     def _find_asset(self):
-        """根据当前选择的版本与目标, 找到对应的 .bin 资产。"""
+        """根据当前选择的版本与目标, 找到对应的 .bin 资产。
+
+        内置固件优先: 直接按目标返回本地文件, 不走 Release。
+        """
+        if self.bundled:
+            return self.bundled.get(self.target_var.get())
         tag = self.version_var.get()
         target = TARGETS.get(self.target_var.get())
         if not tag or not target:
@@ -736,12 +807,24 @@ class FlasherApp:
                 text=f"固件: {asset['name']}  ({asset['size'] // 1024} KB)",
                 foreground="#080",
             )
+        elif self.bundled:
+            self.asset_hint.config(
+                text="内置固件中没有所选目标的固件", foreground="#a00",
+            )
         else:
             self.asset_hint.config(
                 text="该版本下未找到匹配所选目标的固件", foreground="#a00",
             )
 
-    # ---------------- 下载 ----------------
+    # ---------------- 固件获取 ----------------
+    def _resolve_firmware(self, asset):
+        """拿到可烧录的本地固件路径: 内置直接用, 在线资产才下载。"""
+        path = asset.get("path")
+        if path:
+            self.log(f"使用内置固件: {asset['name']}")
+            return path
+        return self._download_asset(asset)
+
     def _download_asset(self, asset):
         headers = {}
         token = os.environ.get("GITHUB_TOKEN")
@@ -794,7 +877,7 @@ class FlasherApp:
             chip = target["chip"]
             port = self._port_from_label(self.port_var.get())
             baud = self.baud_var.get()
-            path = self._download_asset(asset)
+            path = self._resolve_firmware(asset)
             args = [
                 "--chip", chip,
                 "--port", port,

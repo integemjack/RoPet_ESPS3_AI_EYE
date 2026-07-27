@@ -17,5 +17,7 @@ main/mmap_generate_emoji.h
 # flasher 打包时由 CI 生成的版本文件
 scripts/flasher/_version.py
 scripts/flasher/__pycache__/
+# flasher 内置固件 (CI 下载 build 产物后放这里, 不入库)
+scripts/flasher/firmware/
 zhengchen-eye/release/
 zhengchen-eye/target.bin

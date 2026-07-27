@@ -14,12 +14,14 @@
 
 | 信号 | C5 GPIO | 宏 |
 |------|---------|-----|
-| UART TX | **GPIO4** | `BRIDGE_UART_TX_PIN` |
-| UART RX | **GPIO3** | `BRIDGE_UART_RX_PIN` |
-
-> ⚠️ ESP32-C5 的 **GPIO13=USB D-、GPIO14=USB D+**，绝不能用作 UART，否则一启动就掐断 USB（烧录后 esptool/monitor 全部失联、也没热点）。已避开。
+| UART TX | **GPIO9** | `BRIDGE_UART_TX_PIN` |
+| UART RX | **GPIO10** | `BRIDGE_UART_RX_PIN` |
+| RTS（流控，默认关） | -1 | `BRIDGE_UART_RTS_PIN` |
+| CTS（流控，默认关） | -1 | `BRIDGE_UART_CTS_PIN` |
 | 端口 | UART_NUM_1 | `BRIDGE_UART_PORT` |
 | 波特率 | 921600 | `BRIDGE_UART_BAUD` |
+
+> ⚠️ ESP32-C5 的 **GPIO13=USB D-、GPIO14=USB D+**，绝不能用作 UART，否则一启动就掐断 USB（烧录后 esptool/monitor 全部失联、也没热点）。已避开。
 
 ### S3 侧针脚（随所选板卡不同！定义在各板卡 `config.h` 的 `ML307_TX_PIN` / `ML307_RX_PIN`）
 
@@ -44,21 +46,21 @@
 ### 接线（TX/RX 必须交叉！）— doit-esp32s3-eye-8311
 
 ```
-   C5                         S3 (doit-esp32s3-eye-8311)
- ┌──────────┐               ┌───────────────────────────┐
- │ TX GPIO4 │──────────────>│ IO48  ML307_RX_PIN (S3 收) │
- │ RX GPIO3 │<──────────────│ IO47  ML307_TX_PIN (S3 发) │
- │ GND      │───────────────│ GND                       │
- │ 3V3      │───────────────│ 3V3                       │
- └──────────┘               └───────────────────────────┘
+   C5                          S3 (doit-esp32s3-eye-8311)
+ ┌───────────┐               ┌───────────────────────────┐
+ │ TX GPIO9  │──────────────>│ IO48  ML307_RX_PIN (S3 收) │
+ │ RX GPIO10 │<──────────────│ IO47  ML307_TX_PIN (S3 发) │
+ │ GND       │───────────────│ GND                       │
+ │ 3V3       │───────────────│ 3V3                       │
+ └───────────┘               └───────────────────────────┘
 ```
 
 > 方向说明：`ML307_RX_PIN`/`ML307_TX_PIN` 是**从 S3 角度**命名的。
-> IO48 是 S3 的**接收**脚（原来接 4G 模组的 TX），所以现在接 C5 的 **TX(GPIO4)**；
-> IO47 是 S3 的**发送**脚（原来接 4G 模组的 RX），所以现在接 C5 的 **RX(GPIO3)**。
+> IO48 是 S3 的**接收**脚（原来接 4G 模组的 TX），所以现在接 C5 的 **TX(GPIO9)**；
+> IO47 是 S3 的**发送**脚（原来接 4G 模组的 RX），所以现在接 C5 的 **RX(GPIO10)**。
 
-- [ ] **C5.TX(GPIO4) → S3.IO48(ML307_RX_PIN)**
-- [ ] **C5.RX(GPIO3) → S3.IO47(ML307_TX_PIN)**
+- [ ] **C5.TX(GPIO9) → S3.IO48(ML307_RX_PIN)**
+- [ ] **C5.RX(GPIO10) → S3.IO47(ML307_TX_PIN)**
 - [ ] **GND 共地**（必接，否则通信不稳定）
 - [ ] **供电**：3V3 共用或各自独立供电（独立供电时仍需共地）
 - [ ] **烧录 C5**：`cd c5_wifi_bridge; idf.py -p <C5口> flash monitor`
@@ -66,7 +68,7 @@
 - [ ] **切到 C5 网络**：NVS `network.type = 2`（或按键循环 `SwitchNetworkType()` 切到 C5）
 
 > 波特率两端都是 921600，务必一致。
-> 若 C5 的 GPIO4/5 与你的 C5 开发板上其它功能冲突，改 `bridge_internal.h` 里的
+> 若 C5 的 GPIO9/10 与你的 C5 开发板上其它功能冲突，改 `bridge_internal.h` 里的
 > `BRIDGE_UART_TX_PIN` / `BRIDGE_UART_RX_PIN` 即可，重新编译烧录。
 
 ---
