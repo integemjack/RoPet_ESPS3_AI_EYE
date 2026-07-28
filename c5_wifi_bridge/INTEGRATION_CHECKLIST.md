@@ -14,8 +14,8 @@
 
 | 信号 | C5 GPIO | 宏 |
 |------|---------|-----|
-| UART TX | **GPIO9** | `BRIDGE_UART_TX_PIN` |
-| UART RX | **GPIO10** | `BRIDGE_UART_RX_PIN` |
+| UART TX | **GPIO9** | `BRIDGE_UART_TX_PIN` | 48
+| UART RX | **GPIO10** | `BRIDGE_UART_RX_PIN` | 47
 | RTS（流控，默认关） | -1 | `BRIDGE_UART_RTS_PIN` |
 | CTS（流控，默认关） | -1 | `BRIDGE_UART_CTS_PIN` |
 | 端口 | UART_NUM_1 | `BRIDGE_UART_PORT` |
