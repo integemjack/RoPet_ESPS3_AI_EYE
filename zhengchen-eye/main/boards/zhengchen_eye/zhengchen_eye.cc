@@ -179,11 +179,15 @@ private:
             }
             app.ToggleChatState();
         });
-#if CONFIG_USE_4G_WIFI
-        boot_button_.OnMultipleClick([this]() {
-            SwitchNetworkType();
-        });
-#endif
+        // [已禁用] 多击切换网络类型 (WIFI / 4G / C5)。
+        //
+        // 本机固定走 C5 网桥, 且配网热点跑在 S3 自己的 2.4G 射频上。误触切到
+        // WIFI 模式会让那颗射频改去做 STA, 与配网热点冲突; 切到 4G 模式则整个
+        // C5 链路失效。这两种情况用户都只能靠再次多击摸回来, 代价远大于收益,
+        // 因此不再绑定该手势。需要切换时改 NVS 的 network.type 即可
+        // (0=WIFI, 1=ML307/4G, 2=C5), 见 DualNetworkBoard::LoadNetworkTypeFromSettings。
+        //
+        // boot_button_.OnMultipleClick([this]() { SwitchNetworkType(); });
         boot_button_.OnLongPress([this]() {
             // WIFI 模式清本机凭据; C5 模式发帧让网桥清它自己的凭据。两者都会重启进配网。
             ESP_LOGW(TAG, "boot button: long press -> reset wifi configuration");

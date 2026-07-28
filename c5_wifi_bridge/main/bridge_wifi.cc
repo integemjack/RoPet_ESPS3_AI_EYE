@@ -341,11 +341,30 @@ extern "C" void bridge_wifi_try_config(const char* ssid, const char* password)
         return;
     }
 
+    // 先把真实原因取出来再断开: esp_wifi_disconnect() 自己会产生一个
+    // reason=8 (ASSOC_LEAVE) 的断连事件, 之后再读就只剩我们自己造的原因了。
+    uint8_t fail_reason = s_prov_disconnect_reason;
     esp_wifi_disconnect();
-    const char* reason = (s_prov_disconnect_reason == WIFI_REASON_NO_AP_FOUND)
-                             ? "找不到该 WiFi, 请确认名称和信号"
-                             : "连接失败, 请检查密码";
-    ESP_LOGW(TAG, "verify failed for %s (reason=%d)", ssid, s_prov_disconnect_reason);
+
+    const char* reason;
+    switch (fail_reason) {
+    case WIFI_REASON_NO_AP_FOUND:
+        reason = "找不到该 WiFi, 请确认名称和信号";
+        break;
+    case WIFI_REASON_AUTH_FAIL:
+    case WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT:
+    case WIFI_REASON_HANDSHAKE_TIMEOUT:
+        reason = "密码错误";
+        break;
+    case 0:
+        // 15s 内一次断连事件都没有: 通常是 AP 根本没响应
+        reason = "连接超时, 请确认 WiFi 可用";
+        break;
+    default:
+        reason = "连接失败, 请检查密码";
+        break;
+    }
+    ESP_LOGW(TAG, "verify failed for %s (reason=%d)", ssid, fail_reason);
     report_config_result(false, reason);
 }
 
