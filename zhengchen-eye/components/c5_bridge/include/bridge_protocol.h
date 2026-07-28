@@ -33,7 +33,8 @@ extern "C" {
 #define BRIDGE_HEADER_LEN    6       /* magic(2)+type(1)+link(1)+len(2) */
 #define BRIDGE_CRC_LEN       2
 
-/* 消息类型。0x0x = 控制/WiFi, 0x1x = socket, 0xEx = 事件/日志 */
+/* 消息类型。0x0x = 控制/WiFi, 0x1x = socket, 0x2x = 舵机/动作,
+ *          0x8x/0x9x/0xAx = 事件, 0xEx = 日志 */
 typedef enum {
     /* ---- S3 -> C5 : 控制 ---- */
     BRIDGE_CMD_PING          = 0x01, /* payload: 空; C5 回 EVT_PONG */
@@ -58,6 +59,17 @@ typedef enum {
     BRIDGE_CMD_SOCK_CLOSE    = 0x12, /* 关闭 link */
     BRIDGE_CMD_UDP_SENDTO    = 0x13, /* payload: bridge_udp_hdr_t + data (面向无连接时使用) */
 
+    /* ---- S3 -> C5 : 舵机/动作 ----
+     * 舵机挂在 C5 上 (S3 引脚已用尽)。分工: S3 决定"做什么动作"(语义),
+     * C5 决定"怎么把它走出来"(50Hz 插值 + LEDC 硬件 PWM)。
+     * 绝不让 S3 按帧下发角度 —— 那会和音频/socket 抢这根无流控的 UART,
+     * 抖动直接变成舵机颤动。 */
+    BRIDGE_CMD_MOTION_PLAY   = 0x20, /* payload: bridge_motion_play_t, 播放预置动作 */
+    BRIDGE_CMD_MOTION_POSE   = 0x21, /* payload: count(1) + count×bridge_servo_pose_t, 直给角度(标定用) */
+    BRIDGE_CMD_MOTION_STOP   = 0x22, /* payload: flags(1), 见 BRIDGE_MOTION_STOP_* */
+    BRIDGE_CMD_MOTION_TRIM   = 0x23, /* payload: count(1) + count×bridge_servo_trim_t, 写 C5 NVS */
+    BRIDGE_CMD_MOTION_QUERY  = 0x24, /* 请求上报动作状态; C5 回 EVT_MOTION_STATE */
+
     /* ---- C5 -> S3 : 事件 ---- */
     BRIDGE_EVT_READY         = 0x80, /* C5 启动完成 */
     BRIDGE_EVT_PONG          = 0x81,
@@ -76,8 +88,93 @@ typedef enum {
     BRIDGE_EVT_SOCK_OPENED   = 0x90, /* payload: bridge_sock_result_t (link_id 在帧头) */
     BRIDGE_EVT_SOCK_DATA     = 0x91, /* payload: 原始数据 */
     BRIDGE_EVT_SOCK_CLOSED   = 0x92, /* 远端关闭或出错 */
+    /* 一次 MOTION_PLAY 结束 (正常走完 / 被抢占 / 出错)。payload: bridge_motion_done_t */
+    BRIDGE_EVT_MOTION_DONE   = 0xA0,
+    BRIDGE_EVT_MOTION_STATE  = 0xA1, /* payload: bridge_motion_state_t */
     BRIDGE_EVT_LOG           = 0xE0, /* payload: ASCII 调试文本 */
 } bridge_msg_type_t;
+
+/* ---- 舵机 ---- */
+
+/* 通道编号。改机构时这里和 C5 的 servo_ctrl.c 引脚表要一起改。 */
+#define BRIDGE_SERVO_FRONT_LEFT   0
+#define BRIDGE_SERVO_FRONT_RIGHT  1
+#define BRIDGE_SERVO_REAR_LEFT    2
+#define BRIDGE_SERVO_REAR_RIGHT   3
+#define BRIDGE_SERVO_TAIL         4
+#define BRIDGE_SERVO_COUNT        5
+#define BRIDGE_SERVO_MAX          8   /* 协议上限, 状态帧按这个开数组 */
+
+/* 预置动作 id。语义由 C5 的动作表实现, S3 只认 id。 */
+typedef enum {
+    BRIDGE_MOTION_HOME        = 0,  /* 全部回归中位 */
+    BRIDGE_MOTION_WAG_TAIL    = 1,  /* 摇尾巴 */
+    BRIDGE_MOTION_WALK        = 2,  /* 四肢对角步态 */
+    BRIDGE_MOTION_WAVE        = 3,  /* 抬起一只前肢挥手 (direction: -1=左 1=右) */
+    BRIDGE_MOTION_STRETCH     = 4,  /* 伸懒腰 */
+    BRIDGE_MOTION_SHIVER      = 5,  /* 小幅高频抖动 (害怕/冷) */
+    BRIDGE_MOTION_SIT         = 6,  /* 坐下 (静态姿态) */
+    BRIDGE_MOTION_LIE         = 7,  /* 趴下 (静态姿态) */
+    BRIDGE_MOTION_JUMP        = 8,  /* 四肢同相蹦跳 */
+    BRIDGE_MOTION_DANCE       = 9,  /* 四肢交替 + 尾巴快摇 */
+    BRIDGE_MOTION_NOD_BODY    = 10, /* 前肢下压再起, 像点头 */
+    BRIDGE_MOTION_MAX
+} bridge_motion_action_t;
+
+/* MOTION_PLAY 的 flags */
+#define BRIDGE_MOTION_F_PREEMPT   0x01  /* 清空队列并打断当前动作, 立即执行 */
+#define BRIDGE_MOTION_F_HOME_END  0x02  /* 走完后回归中位 */
+
+/* MOTION_STOP 的 flags */
+#define BRIDGE_MOTION_STOP_CLEAR  0x01  /* 清空待执行队列 */
+#define BRIDGE_MOTION_STOP_HOME   0x02  /* 停止后回归中位 */
+#define BRIDGE_MOTION_STOP_DETACH 0x04  /* 停止后立刻断 PWM (松力省电) */
+
+/* MOTION_DONE 的 result */
+#define BRIDGE_MOTION_R_OK        0     /* 正常走完 */
+#define BRIDGE_MOTION_R_PREEMPTED 1     /* 被抢占或 STOP 打断 */
+#define BRIDGE_MOTION_R_BADPARAM  2     /* 动作 id / 参数非法 */
+#define BRIDGE_MOTION_R_FAULT     3     /* 保护触发 (超时等) */
+
+/* CMD_MOTION_PLAY payload */
+typedef struct __attribute__((packed)) {
+    uint16_t seq;        /* S3 递增序号, 用来把 EVT_MOTION_DONE 对上是哪次调用 */
+    uint8_t  action;     /* bridge_motion_action_t */
+    uint8_t  repeat;     /* 重复周期数 1..50 */
+    uint16_t period_ms;  /* 单周期时长, 200..5000 (越小越快) */
+    uint8_t  amount;     /* 幅度 0..100 (%), 由 C5 映射到各通道的机械限位内 */
+    int8_t   direction;  /* -1 / 0 / +1, 含义随动作而定 */
+    uint8_t  flags;      /* BRIDGE_MOTION_F_* */
+} bridge_motion_play_t;
+
+/* CMD_MOTION_POSE 的单项 (前面有一个 count 字节) */
+typedef struct __attribute__((packed)) {
+    uint8_t  ch;          /* 通道 0..BRIDGE_SERVO_COUNT-1 */
+    int16_t  angle_x10;   /* 目标角度×10 (度), 会被夹到机械限位内 */
+    uint16_t duration_ms; /* 走到位耗时, 0 = 立即 */
+} bridge_servo_pose_t;
+
+/* CMD_MOTION_TRIM 的单项 (前面有一个 count 字节) */
+typedef struct __attribute__((packed)) {
+    uint8_t  ch;
+    int16_t  trim_x10;    /* 中位微调×10 (度), 存在 C5 NVS, 跟着舵机走 */
+} bridge_servo_trim_t;
+
+/* EVT_MOTION_DONE payload */
+typedef struct __attribute__((packed)) {
+    uint16_t seq;
+    uint8_t  action;
+    uint8_t  result;      /* BRIDGE_MOTION_R_* */
+} bridge_motion_done_t;
+
+/* EVT_MOTION_STATE payload */
+typedef struct __attribute__((packed)) {
+    uint8_t  busy;        /* 1 = 正在执行动作 */
+    uint8_t  queued;      /* 队列中待执行的动作数 */
+    uint8_t  attached;    /* 1 = PWM 输出中, 0 = 已 detach 松力 */
+    uint8_t  count;       /* 实际舵机数 */
+    int16_t  angle_x10[BRIDGE_SERVO_MAX];  /* 当前角度 */
+} bridge_motion_state_t;
 
 /* socket 协议类型 */
 typedef enum {

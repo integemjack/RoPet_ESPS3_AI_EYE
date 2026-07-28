@@ -5,6 +5,7 @@
  *      C5 用自身 5GHz WiFi 建立 TCP/TLS/UDP 连接并透传数据。
  */
 #include "bridge_internal.h"
+#include "servo_ctrl.h"
 
 #include <string.h>
 #include "freertos/FreeRTOS.h"
@@ -17,6 +18,9 @@ static const char *TAG = "c5_bridge";
 void bridge_dispatch_frame(uint8_t type, uint8_t link_id,
                            const uint8_t *payload, uint16_t len)
 {
+    /* 任意一帧都算链路存活。S3 挂了/UART 断了要让舵机松力, 不能堵着。 */
+    servo_ctrl_notify_link_alive();
+
     switch (type) {
     case BRIDGE_CMD_PING:
         bridge_send_frame(BRIDGE_EVT_PONG, BRIDGE_NO_LINK, NULL, 0);
@@ -97,6 +101,29 @@ void bridge_dispatch_frame(uint8_t type, uint8_t link_id,
         bridge_sock_close(link_id);
         break;
 
+    /* ---- 舵机 ----
+     * 这几个入口必须是非阻塞的: 这里跑在 UART 收帧任务上, 一旦 vTaskDelay
+     * 就会把整条网络链路堵住。真正耗时的动作全部丢给 servo 任务。 */
+    case BRIDGE_CMD_MOTION_PLAY:
+        servo_ctrl_play(payload, len);
+        break;
+
+    case BRIDGE_CMD_MOTION_POSE:
+        servo_ctrl_pose(payload, len);
+        break;
+
+    case BRIDGE_CMD_MOTION_STOP:
+        servo_ctrl_stop(len >= 1 ? payload[0] : BRIDGE_MOTION_STOP_CLEAR);
+        break;
+
+    case BRIDGE_CMD_MOTION_TRIM:
+        servo_ctrl_set_trim(payload, len);
+        break;
+
+    case BRIDGE_CMD_MOTION_QUERY:
+        servo_ctrl_report_state();
+        break;
+
     default:
         ESP_LOGW(TAG, "unknown frame type 0x%02x", type);
         break;
@@ -109,7 +136,8 @@ void app_main(void)
 
     bridge_uart_init();
     bridge_sock_init();
-    bridge_wifi_init();
+    bridge_wifi_init();     /* 内含 nvs_flash_init, 必须在 servo_ctrl_init 之前 */
+    servo_ctrl_init();
 
     bridge_uart_start_rx_task();
 

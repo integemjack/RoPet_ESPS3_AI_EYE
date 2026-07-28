@@ -4,11 +4,13 @@ idf_component_register(
         "bridge_uart.c"
         "bridge_wifi.cc"
         "bridge_sock.c"
+        "servo_ctrl.c"
     INCLUDE_DIRS
         "."
         ".."             # 引用工程根下的 bridge_protocol.h (与 S3 端共享)
     REQUIRES
         driver
+        esp_timer
         esp_wifi
         esp_netif
         esp_event

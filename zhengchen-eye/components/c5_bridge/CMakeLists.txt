@@ -11,6 +11,7 @@ idf_component_register(
         "c5_udp.cc"
         "c5_mqtt.cc"
         "c5_network.cc"
+        "c5_motion.cc"
         "c5_provision_portal.cc"
     INCLUDE_DIRS
         "include"

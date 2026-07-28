@@ -121,6 +121,14 @@ public:
     // 低层发帧 (线程安全)
     bool SendFrame(uint8_t type, uint8_t link_id, const uint8_t* payload, uint16_t len);
 
+    // 注册动作帧 (EVT_MOTION_*) 的处理器, 由 C5Motion 挂上。
+    // 用 std::function 而不是直接持有 C5Motion*, 避免 c5_bridge.h 反向依赖 c5_motion.h。
+    // 回调跑在 UART 收帧任务上, 实现里不要阻塞。
+    void SetMotionFrameHandler(std::function<void(uint8_t type, const uint8_t* payload, uint16_t len)> handler) {
+        std::lock_guard<std::mutex> lk(motion_mutex_);
+        motion_handler_ = std::move(handler);
+    }
+
 private:
     void RxTask();
     void DispatchFrame(uint8_t type, uint8_t link_id, const uint8_t* payload, uint16_t len);
@@ -142,6 +150,9 @@ private:
 
     C5Link links_[BRIDGE_MAX_LINKS];
     std::mutex links_mutex_;
+
+    std::function<void(uint8_t, const uint8_t*, uint16_t)> motion_handler_;
+    std::mutex motion_mutex_;
 
     volatile bool c5_ready_ = false;
     volatile bool wifi_connected_ = false;

@@ -18,6 +18,16 @@ Esp32C5Board::Esp32C5Board(gpio_num_t tx_pin, gpio_num_t rx_pin, size_t rx_buffe
                            gpio_num_t rts_pin, gpio_num_t cts_pin)
     : bridge_(tx_pin, rx_pin, rx_buffer_size), rts_pin_(rts_pin), cts_pin_(cts_pin) {
     network_ = std::make_unique<C5Network>(bridge_);
+
+    // 舵机在 C5 侧, 走同一条 UART。把 EVT_MOTION_* 的回帧接到 C5Motion 上。
+    motion_ = std::make_unique<C5Motion>(bridge_);
+    bridge_.SetMotionFrameHandler([this](uint8_t type, const uint8_t* payload, uint16_t len) {
+        if (type == BRIDGE_EVT_MOTION_DONE) {
+            motion_->HandleDoneFrame(payload, len);
+        } else {
+            motion_->HandleStateFrame(payload, len);
+        }
+    });
 }
 
 std::string Esp32C5Board::GetBoardType() {

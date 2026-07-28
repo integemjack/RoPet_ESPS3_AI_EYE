@@ -291,6 +291,17 @@ void C5Bridge::DispatchFrame(uint8_t type, uint8_t link_id, const uint8_t* paylo
         break;
     }
 
+    case BRIDGE_EVT_MOTION_DONE:
+    case BRIDGE_EVT_MOTION_STATE: {
+        std::function<void(uint8_t, const uint8_t*, uint16_t)> h;
+        {
+            std::lock_guard<std::mutex> lk(motion_mutex_);
+            h = motion_handler_;
+        }
+        if (h) h(type, payload, len);
+        break;
+    }
+
     case BRIDGE_EVT_LOG:
         ESP_LOGI("C5", "%.*s", (int)len, (const char*)payload);
         break;

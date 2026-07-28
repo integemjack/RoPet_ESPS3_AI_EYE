@@ -5,6 +5,7 @@
 
 #include "board.h"
 #include "c5_bridge.h"
+#include "c5_motion.h"
 #include "c5_network.h"
 #include "c5_provision_portal.h"
 
@@ -15,6 +16,7 @@ class Esp32C5Board : public Board {
 protected:
     C5Bridge bridge_;
     std::unique_ptr<C5Network> network_;
+    std::unique_ptr<C5Motion> motion_;
 
     std::unique_ptr<C5ProvisionPortal> portal_;
 
@@ -38,6 +40,11 @@ public:
     virtual void SetPowerSaveMode(bool enabled) override;
     virtual AudioCodec* GetAudioCodec() override { return nullptr; }
     virtual std::string GetDeviceStatusJson() override;
+
+    // 舵机(四肢+尾巴)挂在 C5 上, 通过同一条 UART 下发动作指令。
+    // 注意 UART 要等 StartNetwork() 里的 bridge_.Start() 之后才通, 在那之前
+    // 发帧只会石沉大海 —— 板级代码不要在构造函数里就播动作。
+    C5Motion* GetMotion() { return motion_.get(); }
 
     // 重置配网: 与 WifiBoard::ResetWifiConfiguration 语义对齐, 但凭据存在 C5 上,
     // 所以是发帧让 C5 清除并重启, S3 随后一起重启等待 C5 的配网热点。

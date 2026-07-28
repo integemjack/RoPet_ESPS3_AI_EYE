@@ -19,6 +19,8 @@
 #include "power_save_timer.h"
 #include "../zhengchen-1.54tft-wifi/power_manager.h"
 #include "driver/touch_pad.h"
+#include "device_state_event.h"
+#include "eye_motion.h"
 
 #if CONFIG_USE_LCD_240X240_GIF1 || CONFIG_USE_LCD_240X240_GIF2
 #include <esp_lcd_gc9a01.h>
@@ -64,6 +66,20 @@ static const gc9a01_lcd_init_cmd_t gc9107_lcd_init_cmds[] = {
 
 LV_FONT_DECLARE(font_puhui_16_4);
 LV_FONT_DECLARE(font_awesome_16_4);
+
+// 在显示层拦一道情绪, 顺手驱动四肢/尾巴。
+// 走子类而不是改 application.cc: 情绪派发在核心代码里 (application.cc 的
+// "llm" 分支), 那是上游小智的文件, 改了以后每次同步上游都要处理冲突。
+// SetEmotion 是虚函数, 覆写它零侵入。
+class EyeLcdDisplay : public SpiLcdDisplay {
+public:
+    using SpiLcdDisplay::SpiLcdDisplay;
+
+    void SetEmotion(const char* emotion) override {
+        SpiLcdDisplay::SetEmotion(emotion);
+        EyeMotion::GetInstance().OnEmotion(emotion);
+    }
+};
 
 
 class zhengchen_eye : public DualNetworkBoard {
@@ -126,6 +142,8 @@ private:
                 printf("DEBUG RAW -> Left(4): %ld, Right(5): %ld\n", self->touch_value, self->touch_value1);
                 // if (app.GetDeviceState() == kDeviceStateIdle) {
                 if (app.GetDeviceState() == kDeviceStateIdle || app.GetDeviceState() == kDeviceStateListening) {
+                    // 动作先出: 物理交互的反馈要立刻, 不能等 LLM 一个来回。
+                    EyeMotion::GetInstance().OnTouch(/*left=*/true);
                     // app.WakeWordInvoke("摸了头，回答情绪");
                     app.WakeWordInvoke("摸了左头，情绪化回应");
                 }
@@ -138,6 +156,7 @@ private:
                 printf("DEBUG RAW -> Left(4): %ld, Right(5): %ld\n", self->touch_value, self->touch_value1);
                 // if (app.GetDeviceState() == kDeviceStateIdle) {
                 if (app.GetDeviceState() == kDeviceStateIdle || app.GetDeviceState() == kDeviceStateListening) {
+                    EyeMotion::GetInstance().OnTouch(/*left=*/false);
                     // app.WakeWordInvoke("正在抚摸你的身体，给出情绪化回答");
                     // app.WakeWordInvoke("摸了身体，回答情绪");
                     app.WakeWordInvoke("摸了右头，情绪化回应");
@@ -205,6 +224,31 @@ private:
     }
 
 
+    // 舵机挂在 C5 上, 只有当前网络模式真的是 C5 时链路才存在。
+    // 用 static_cast 而不是 dynamic_cast: IDF 默认 -fno-rtti, 且这里的类型
+    // 已经由 GetNetworkType() 判定, 与本文件 InitializeButtons() 里对
+    // WifiBoard 的处理方式一致。
+    C5Motion* ResolveMotion() {
+        if (GetNetworkType() != NetworkType::C5) {
+            return nullptr;
+        }
+        return static_cast<Esp32C5Board&>(GetCurrentBoard()).GetMotion();
+    }
+
+    void InitializeMotion() {
+        auto& eye_motion = EyeMotion::GetInstance();
+
+        // 惰性解析: UART 要等 StartNetwork() 里的 bridge_.Start() 之后才通,
+        // 而这里还在板卡构造期。传闭包进去, 用的时候再取。
+        eye_motion.Initialize([this]() { return ResolveMotion(); });
+        eye_motion.RegisterMcpTools();
+
+        DeviceStateEventManager::GetInstance().RegisterStateChangeCallback(
+            [](DeviceState previous, DeviceState current) {
+                EyeMotion::GetInstance().OnDeviceStateChanged(previous, current);
+            });
+    }
+
     void InitializeSpi() {
         spi_bus_config_t buscfg = {};
         buscfg.mosi_io_num = DISPLAY_SDA;
@@ -264,7 +308,7 @@ private:
         esp_lcd_panel_mirror(panel, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y);
 #endif       
          
-        display_ = new SpiLcdDisplay(panel_io, panel,
+        display_ = new EyeLcdDisplay(panel_io, panel,
             DISPLAY_WIDTH, DISPLAY_HEIGHT, DISPLAY_OFFSET_X, DISPLAY_OFFSET_Y, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y, DISPLAY_SWAP_XY,
             {
                 .text_font = &font_puhui_16_4,
@@ -286,6 +330,7 @@ public:
         GetBacklight()->SetBrightness(100);
 #endif
         touch_init();
+        InitializeMotion();
         GetAudioCodec()->SetOutputVolume(100);
         xTaskCreate(touch_read_task, "touch_read_task", 2048, this, 5, NULL);
     }
