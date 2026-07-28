@@ -30,7 +30,7 @@ static const char *TAG = "servo";
 
 /* ---------------- 硬件参数 ---------------- */
 
-/* XIAO ESP32C5 引脚: 四肢排 D0~D3, 尾巴 D5, D4 空着备用。
+/* XIAO ESP32C5 引脚: 五路舵机连排 D0~D4 (四肢 D0~D3, 尾巴 D4)。
  *
  * 必须避开的:
  *   D9=GPIO9 / D10=GPIO10  网桥 UART (bridge_internal.h)
@@ -41,12 +41,12 @@ static const char *TAG = "servo";
  *   GPIO25 -> SDIO 采样/驱动时钟沿, 本工程不用 SDIO slave, 无影响
  *   GPIO7  -> JTAG 信号源选择, 最坏情况是复位瞬间干扰 C5 自己的 USB-JTAG 调试
  *
- * 剩余可用: D4=GPIO23, D6=GPIO11, D7=GPIO12, D8=GPIO8 */
+ * 剩余可用: D5=GPIO24, D6=GPIO11, D7=GPIO12, D8=GPIO8 */
 #define SERVO_GPIO_FRONT_LEFT   1    /* D0 */
 #define SERVO_GPIO_FRONT_RIGHT  0    /* D1 */
 #define SERVO_GPIO_REAR_LEFT    25   /* D2 */
 #define SERVO_GPIO_REAR_RIGHT   7    /* D3 */
-#define SERVO_GPIO_TAIL         24   /* D5 */
+#define SERVO_GPIO_TAIL         23   /* D4 */
 
 #define SERVO_PWM_FREQ_HZ       50
 #define SERVO_PWM_RES           LEDC_TIMER_14_BIT
