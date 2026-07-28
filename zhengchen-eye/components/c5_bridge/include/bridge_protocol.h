@@ -2,14 +2,18 @@
  * bridge_protocol.h
  *
  * S3(主控) <-> C5(WiFi 网桥) 之间的 UART 帧协议定义。
- * 本文件被 C5 固件和 S3 端共同引用，两端必须保持一致。
- * (与 c5_wifi_bridge/bridge_protocol.h 内容完全相同)
+ * 本文件被 C5 固件和 S3 端共同引用，请保持两端一致。
  *
  * 帧格式 (小端):
  *   +--------+--------+------+---------+--------+-------------+-------+
  *   | 0xAA   | 0x55   | type | link_id | len(2) | payload(len)| crc(2)|
  *   +--------+--------+------+---------+--------+-------------+-------+
- *   crc16 : CRC16-CCITT (0xFFFF init), 覆盖 type..payload
+ *   magic = 0xAA 0x55
+ *   type    : 1 字节, 见 bridge_msg_type_t
+ *   link_id : 1 字节, socket 编号 (0..BRIDGE_MAX_LINKS-1); 非 socket 类消息填 0xFF
+ *   len     : 2 字节小端, payload 长度
+ *   payload : len 字节
+ *   crc16   : 2 字节小端, CRC16-CCITT (0xFFFF init), 覆盖 type..payload
  */
 #ifndef BRIDGE_PROTOCOL_H
 #define BRIDGE_PROTOCOL_H
@@ -23,55 +27,88 @@ extern "C" {
 
 #define BRIDGE_MAGIC0        0xAA
 #define BRIDGE_MAGIC1        0x55
-#define BRIDGE_MAX_LINKS     6
-#define BRIDGE_NO_LINK       0xFF
-#define BRIDGE_MAX_PAYLOAD   4096
-#define BRIDGE_HEADER_LEN    6
+#define BRIDGE_MAX_LINKS     6       /* 最多同时打开的 socket 数 */
+#define BRIDGE_NO_LINK       0xFF    /* 非 socket 类消息的 link_id 占位 */
+#define BRIDGE_MAX_PAYLOAD   4096    /* 单帧最大 payload */
+#define BRIDGE_HEADER_LEN    6       /* magic(2)+type(1)+link(1)+len(2) */
 #define BRIDGE_CRC_LEN       2
 
+/* 消息类型。0x0x = 控制/WiFi, 0x1x = socket, 0xEx = 事件/日志 */
 typedef enum {
-    BRIDGE_CMD_PING          = 0x01,
-    BRIDGE_CMD_RESET         = 0x02,
-    BRIDGE_CMD_WIFI_CONFIG   = 0x03, /* [已废弃] 配网由 C5 自主完成 */
-    BRIDGE_CMD_WIFI_CONNECT  = 0x04,
-    BRIDGE_CMD_WIFI_DISCONNECT = 0x05,
-    BRIDGE_CMD_GET_STATUS    = 0x06,
+    /* ---- S3 -> C5 : 控制 ---- */
+    BRIDGE_CMD_PING          = 0x01, /* payload: 空; C5 回 EVT_PONG */
+    BRIDGE_CMD_RESET         = 0x02, /* 复位 C5 (重启) */
+    /* 配网热点改由 S3 的 2.4G 射频承载 (C5 单射频, 自己开热点会在 STA 验证时
+     * 被拖去换信道, 手机掉线 -> 配网页 JS 被系统冻结 -> 拿不到验证结果)。
+     * 现在 S3 出热点和网页, C5 只负责扫描 + 验证 + 保存凭据, 射频独占, 随便换台。
+     * payload: ssid_len(1) + ssid + pwd_len(1) + pwd; C5 回 EVT_WIFI_CONFIG_RESULT */
+    BRIDGE_CMD_WIFI_CONFIG   = 0x03,
+    BRIDGE_CMD_WIFI_CONNECT  = 0x04, /* 让 C5 (重新)启动网络: 用已存凭据连, 无则自动开热点配网 */
+    BRIDGE_CMD_WIFI_DISCONNECT = 0x05, /* [保留] */
+    BRIDGE_CMD_GET_STATUS    = 0x06, /* 请求上报状态; C5 回 EVT_WIFI_STATUS */
     BRIDGE_CMD_GET_OTA_URL   = 0x07, /* 请求 C5 配网页保存的 OTA 地址; C5 回 EVT_OTA_URL */
+    BRIDGE_CMD_WIFI_RESET    = 0x08, /* 清除 C5 上保存的 WiFi 凭据; C5 回 EVT_WIFI_RESET_DONE 后自重启进配网 */
+    BRIDGE_CMD_WIFI_SCAN     = 0x09, /* 请求 C5 扫描 5G 频段; C5 回 EVT_WIFI_SCAN_RESULT。
+                                      * S3 的射频只有 2.4G, 看不见 5G AP, 所以配网页的
+                                      * SSID 列表必须由 C5 扫出来回传。 */
 
-    BRIDGE_CMD_SOCK_OPEN     = 0x10,
-    BRIDGE_CMD_SOCK_SEND     = 0x11,
-    BRIDGE_CMD_SOCK_CLOSE    = 0x12,
-    BRIDGE_CMD_UDP_SENDTO    = 0x13,
+    /* ---- S3 -> C5 : socket ---- */
+    BRIDGE_CMD_SOCK_OPEN     = 0x10, /* payload: bridge_sock_open_t 头 + host 字符串 */
+    BRIDGE_CMD_SOCK_SEND     = 0x11, /* payload: 原始数据 */
+    BRIDGE_CMD_SOCK_CLOSE    = 0x12, /* 关闭 link */
+    BRIDGE_CMD_UDP_SENDTO    = 0x13, /* payload: bridge_udp_hdr_t + data (面向无连接时使用) */
 
-    BRIDGE_EVT_READY         = 0x80,
+    /* ---- C5 -> S3 : 事件 ---- */
+    BRIDGE_EVT_READY         = 0x80, /* C5 启动完成 */
     BRIDGE_EVT_PONG          = 0x81,
-    BRIDGE_EVT_WIFI_STATUS   = 0x82,
-    BRIDGE_EVT_OTA_URL       = 0x83, /* payload: OTA 地址字符串 (可空) */
-    BRIDGE_EVT_SOCK_OPENED   = 0x90,
-    BRIDGE_EVT_SOCK_DATA     = 0x91,
-    BRIDGE_EVT_SOCK_CLOSED   = 0x92,
-    BRIDGE_EVT_LOG           = 0xE0,
+    BRIDGE_EVT_WIFI_STATUS   = 0x82, /* payload: bridge_wifi_status_t */
+    BRIDGE_EVT_OTA_URL       = 0x83, /* payload: OTA 地址字符串 (可空, 空表示未配置) */
+    BRIDGE_EVT_WIFI_RESET_DONE = 0x84, /* WIFI_RESET 的应答: 凭据已清除, C5 即将重启 */
+    BRIDGE_EVT_REBOOT_REQUEST  = 0x85, /* 配网成功: C5 通知 S3 立即重启, 随后 C5 自己也重启 */
+    /* payload: count(1) + count×{ rssi(int8), authmode(1), ssid_len(1), ssid[ssid_len] }
+     * 按 RSSI 降序, 已去重 (同 SSID 只保留最强的一个 BSS)。 */
+    BRIDGE_EVT_WIFI_SCAN_RESULT   = 0x86,
+    /* CMD_WIFI_CONFIG 的结果。payload: ok(1) + 其余字节为 UTF-8 错误文案 (ok=1 时为空)。
+     * 注意 C5 在这里只回结果不重启 —— 失败要让用户能在 S3 的配网页上重填, 热点必须还在。 */
+    BRIDGE_EVT_WIFI_CONFIG_RESULT = 0x87,
+    /* C5 启动时发现没有任何已保存凭据, 通知 S3 开配网热点。payload: 空。 */
+    BRIDGE_EVT_NEED_PROVISION     = 0x88,
+    BRIDGE_EVT_SOCK_OPENED   = 0x90, /* payload: bridge_sock_result_t (link_id 在帧头) */
+    BRIDGE_EVT_SOCK_DATA     = 0x91, /* payload: 原始数据 */
+    BRIDGE_EVT_SOCK_CLOSED   = 0x92, /* 远端关闭或出错 */
+    BRIDGE_EVT_LOG           = 0xE0, /* payload: ASCII 调试文本 */
 } bridge_msg_type_t;
 
+/* socket 协议类型 */
 typedef enum {
     BRIDGE_PROTO_TCP = 0,
     BRIDGE_PROTO_TLS = 1,
     BRIDGE_PROTO_UDP = 2,
 } bridge_proto_t;
 
+/* CMD_SOCK_OPEN payload 头, 其后紧跟 host 字符串 (host_len 字节, 不含 '\0') */
 typedef struct __attribute__((packed)) {
-    uint8_t  proto;
-    uint16_t port;
-    uint8_t  host_len;
+    uint8_t  proto;      /* bridge_proto_t */
+    uint16_t port;       /* 小端 */
+    uint8_t  host_len;   /* host 字符串长度 */
     /* char host[host_len]; */
 } bridge_sock_open_t;
 
+/* EVT_SOCK_OPENED payload */
 typedef struct __attribute__((packed)) {
-    uint8_t  ok;
-    int32_t  err;
+    uint8_t  ok;         /* 1 成功, 0 失败 */
+    int32_t  err;        /* 失败时的错误码 (小端) */
 } bridge_sock_result_t;
 
-/* CRC16-CCITT (poly 0x1021, init 0xFFFF) table-driven; keep in sync with C5 side */
+/* EVT_WIFI_STATUS payload */
+typedef struct __attribute__((packed)) {
+    uint8_t  connected;  /* 1 已连接 */
+    int8_t   rssi;       /* dBm */
+    uint8_t  band;       /* 1 = 2.4G, 2 = 5G, 0 = 未知 */
+    uint8_t  ip[4];      /* IPv4, 网络序 (ip[0].ip[1].ip[2].ip[3]) */
+} bridge_wifi_status_t;
+
+/* CRC16-CCITT (poly 0x1021, init 0xFFFF) - 查表法, 结果与逐位算法完全一致 */
 static const uint16_t bridge_crc16_table[256] = {
     0x0000,0x1021,0x2042,0x3063,0x4084,0x50A5,0x60C6,0x70E7,0x8108,0x9129,0xA14A,0xB16B,0xC18C,0xD1AD,0xE1CE,0xF1EF,
     0x1231,0x0210,0x3273,0x2252,0x52B5,0x4294,0x72F7,0x62D6,0x9339,0x8318,0xB37B,0xA35A,0xD3BD,0xC39C,0xF3FF,0xE3DE,
@@ -91,6 +128,7 @@ static const uint16_t bridge_crc16_table[256] = {
     0xEF1F,0xFF3E,0xCF5D,0xDF7C,0xAF9B,0xBFBA,0x8FD9,0x9FF8,0x6E17,0x7E36,0x4E55,0x5E74,0x2E93,0x3EB2,0x0ED1,0x1EF0,
 };
 
+/* 增量更新: 可分段累加 (先算 meta, 再算 payload) */
 static inline uint16_t bridge_crc16_update(uint16_t crc, const uint8_t *data, size_t len)
 {
     for (size_t i = 0; i < len; i++) {
@@ -99,17 +137,11 @@ static inline uint16_t bridge_crc16_update(uint16_t crc, const uint8_t *data, si
     return crc;
 }
 
+/* 一次性计算 (init 0xFFFF) */
 static inline uint16_t bridge_crc16(const uint8_t *data, size_t len)
 {
     return bridge_crc16_update(0xFFFF, data, len);
 }
-
-typedef struct __attribute__((packed)) {
-    uint8_t  connected;
-    int8_t   rssi;
-    uint8_t  band;      /* 1 = 2.4G, 2 = 5G, 0 = 未知 */
-    uint8_t  ip[4];
-} bridge_wifi_status_t;
 
 #ifdef __cplusplus
 }

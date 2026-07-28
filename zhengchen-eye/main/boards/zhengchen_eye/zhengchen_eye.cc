@@ -185,11 +185,9 @@ private:
         });
 #endif
         boot_button_.OnLongPress([this]() {
-            if (GetNetworkType() == NetworkType::WIFI) {
-                auto& wifi_board = static_cast<WifiBoard&>(GetCurrentBoard());
-                wifi_board.ResetWifiConfiguration();
-            }
-            
+            // WIFI 模式清本机凭据; C5 模式发帧让网桥清它自己的凭据。两者都会重启进配网。
+            ESP_LOGW(TAG, "boot button: long press -> reset wifi configuration");
+            ResetWifiConfiguration();
         });
 
 #if CONFIG_USE_DEVICE_AEC

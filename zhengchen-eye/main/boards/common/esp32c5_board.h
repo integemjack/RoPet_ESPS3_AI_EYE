@@ -6,6 +6,7 @@
 #include "board.h"
 #include "c5_bridge.h"
 #include "c5_network.h"
+#include "c5_provision_portal.h"
 
 // 通过 UART 外接 ESP32-C5 WiFi 网桥的板卡。
 // 与 Ml307Board 平行: C5 负责 WiFi(含5G)+配网+socket 透传, S3 通过帧协议驱动。
@@ -15,8 +16,12 @@ protected:
     C5Bridge bridge_;
     std::unique_ptr<C5Network> network_;
 
+    std::unique_ptr<C5ProvisionPortal> portal_;
+
     virtual std::string GetBoardJson() override;
     void WaitForNetworkReady();
+    // C5 报告无可用凭据时, 用 S3 的 2.4G 射频开配网热点 (不会返回)
+    void EnterProvisioningMode();
     void SyncOtaUrlFromC5();
 
     // 硬件流控引脚 (可选, 默认禁用)。填有效 GPIO 且两端都启用才生效。
@@ -33,6 +38,10 @@ public:
     virtual void SetPowerSaveMode(bool enabled) override;
     virtual AudioCodec* GetAudioCodec() override { return nullptr; }
     virtual std::string GetDeviceStatusJson() override;
+
+    // 重置配网: 与 WifiBoard::ResetWifiConfiguration 语义对齐, 但凭据存在 C5 上,
+    // 所以是发帧让 C5 清除并重启, S3 随后一起重启等待 C5 的配网热点。
+    virtual void ResetWifiConfiguration();
 };
 
 #endif // ESP32C5_BOARD_H

@@ -52,8 +52,22 @@ void bridge_wifi_start(void);  /* 用已存凭据连接; 失败则开热点配�
 /* 填充并主动上报一次 WiFi 状态帧 */
 void bridge_wifi_report_status(void);
 bool bridge_wifi_is_connected(void);
+/* 是否处于"等待 S3 配网"状态 (无可用凭据)。 */
+bool bridge_wifi_is_provisioning(void);
+/* 在配网状态下重发一次 NEED_PROVISION。
+ * 必须周期性重发: 两端各自独立重启, C5 通常比 S3 先起来, 开机那一发很可能
+ * 打在 S3 的 UART 还没初始化的窗口里, 一次性事件会直接丢失。 */
+void bridge_wifi_announce_provision(void);
 /* 读取配网页保存的 OTA 地址 (C5 NVS wifi.ota_url), 通过 EVT_OTA_URL 回传 S3 */
 void bridge_wifi_report_ota_url(void);
+/* 清除 NVS 里保存的全部 WiFi 凭据 (保留 ota_url)。
+ * 返回后调用方负责重启: 无凭据启动会进入配网模式并通知 S3 开热点。 */
+void bridge_wifi_reset_credentials(void);
+/* 扫描 5G 频段, 结果通过 EVT_WIFI_SCAN_RESULT 回传 S3 (S3 只有 2.4G 射频)。 */
+void bridge_wifi_scan_and_report(void);
+/* 用 S3 下发的凭据做一次真实连接验证, 成功才写 NVS;
+ * 结果通过 EVT_WIFI_CONFIG_RESULT 回传。无论成败都不在此处重启。 */
+void bridge_wifi_try_config(const char* ssid, const char* password);
 
 /* ---- Socket 层 ---- */
 void bridge_sock_init(void);

@@ -42,6 +42,40 @@ void bridge_dispatch_frame(uint8_t type, uint8_t link_id,
         bridge_wifi_report_ota_url();
         break;
 
+    case BRIDGE_CMD_WIFI_SCAN:
+        /* S3 的配网页要列 SSID; 它自己的 2.4G 射频看不见 5G AP, 只能问 C5 */
+        bridge_wifi_scan_and_report();
+        break;
+
+    case BRIDGE_CMD_WIFI_CONFIG: {
+        /* payload: ssid_len(1) + ssid + pwd_len(1) + pwd */
+        if (len < 1) break;
+        uint8_t ssid_len = payload[0];
+        if (1 + ssid_len + 1 > len) break;
+        uint8_t pwd_len = payload[1 + ssid_len];
+        if (1 + ssid_len + 1 + pwd_len > len) break;
+
+        char ssid[33] = {0};
+        char pwd[65] = {0};
+        memcpy(ssid, payload + 1, ssid_len < 32 ? ssid_len : 32);
+        memcpy(pwd, payload + 1 + ssid_len + 1, pwd_len < 64 ? pwd_len : 64);
+        bridge_wifi_try_config(ssid, pwd);
+        break;
+    }
+
+    case BRIDGE_CMD_WIFI_RESET:
+        /* S3 长按 BOOT 触发: 清掉本地凭据并重启。重启后没有可用 SSID,
+         * bridge_wifi_start() 会自动开热点进配网页。
+         * 先回 ACK 再重启, 让 S3 能确认命令送达 (而不是靠超时猜)。 */
+        ESP_LOGW(TAG, "wifi reset requested by S3");
+        bridge_wifi_reset_credentials();
+        bridge_send_frame(BRIDGE_EVT_WIFI_RESET_DONE, BRIDGE_NO_LINK, NULL, 0);
+        /* 等 ACK 和上面的日志帧真正发完 (921600bps 下几十字节远不到 1ms,
+         * 给 200ms 余量), 否则 esp_restart 会截断 UART 输出。 */
+        vTaskDelay(pdMS_TO_TICKS(200));
+        esp_restart();
+        break;
+
     case BRIDGE_CMD_SOCK_OPEN: {
         /* payload: bridge_sock_open_t + host[host_len] */
         if (len < sizeof(bridge_sock_open_t)) break;
@@ -96,6 +130,11 @@ void app_main(void)
                  (unsigned long)(++tick), (int)bridge_wifi_is_connected());
         if (bridge_wifi_is_connected()) {
             bridge_wifi_report_status();
+        } else {
+            /* 配网状态下持续吆喝。C5 一般比 S3 先启动完, 开机时发的那一发
+             * NEED_PROVISION 很可能落在 S3 的 UART 尚未初始化的窗口里被丢掉,
+             * 靠周期重发兜底, S3 无论何时起来都能在 5 秒内收到。 */
+            bridge_wifi_announce_provision();
         }
     }
 }

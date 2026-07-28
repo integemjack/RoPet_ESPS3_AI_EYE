@@ -47,6 +47,12 @@ public:
     
     // 获取当前活动的板卡引用
     Board& GetCurrentBoard() const { return *current_board_; }
+
+    // 重置当前网络的 WiFi 配置:
+    //   WIFI -> 置 force_ap 标志并重启, S3 自己开配网热点
+    //   C5   -> 发帧让 C5 清除凭据并重启, S3 随后重启
+    //   ML307-> 4G 无 WiFi 凭据, 空操作
+    void ResetWifiConfiguration();
     
     // 重写Board接口
     virtual std::string GetBoardType() override;

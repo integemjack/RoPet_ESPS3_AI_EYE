@@ -38,11 +38,19 @@ typedef enum {
     /* ---- S3 -> C5 : 控制 ---- */
     BRIDGE_CMD_PING          = 0x01, /* payload: 空; C5 回 EVT_PONG */
     BRIDGE_CMD_RESET         = 0x02, /* 复位 C5 (重启) */
-    BRIDGE_CMD_WIFI_CONFIG   = 0x03, /* [已废弃] 配网改由 C5 自主完成(SoftAP+网页), S3 不下发凭据 */
+    /* 配网热点改由 S3 的 2.4G 射频承载 (C5 单射频, 自己开热点会在 STA 验证时
+     * 被拖去换信道, 手机掉线 -> 配网页 JS 被系统冻结 -> 拿不到验证结果)。
+     * 现在 S3 出热点和网页, C5 只负责扫描 + 验证 + 保存凭据, 射频独占, 随便换台。
+     * payload: ssid_len(1) + ssid + pwd_len(1) + pwd; C5 回 EVT_WIFI_CONFIG_RESULT */
+    BRIDGE_CMD_WIFI_CONFIG   = 0x03,
     BRIDGE_CMD_WIFI_CONNECT  = 0x04, /* 让 C5 (重新)启动网络: 用已存凭据连, 无则自动开热点配网 */
     BRIDGE_CMD_WIFI_DISCONNECT = 0x05, /* [保留] */
     BRIDGE_CMD_GET_STATUS    = 0x06, /* 请求上报状态; C5 回 EVT_WIFI_STATUS */
     BRIDGE_CMD_GET_OTA_URL   = 0x07, /* 请求 C5 配网页保存的 OTA 地址; C5 回 EVT_OTA_URL */
+    BRIDGE_CMD_WIFI_RESET    = 0x08, /* 清除 C5 上保存的 WiFi 凭据; C5 回 EVT_WIFI_RESET_DONE 后自重启进配网 */
+    BRIDGE_CMD_WIFI_SCAN     = 0x09, /* 请求 C5 扫描 5G 频段; C5 回 EVT_WIFI_SCAN_RESULT。
+                                      * S3 的射频只有 2.4G, 看不见 5G AP, 所以配网页的
+                                      * SSID 列表必须由 C5 扫出来回传。 */
 
     /* ---- S3 -> C5 : socket ---- */
     BRIDGE_CMD_SOCK_OPEN     = 0x10, /* payload: bridge_sock_open_t 头 + host 字符串 */
@@ -55,6 +63,16 @@ typedef enum {
     BRIDGE_EVT_PONG          = 0x81,
     BRIDGE_EVT_WIFI_STATUS   = 0x82, /* payload: bridge_wifi_status_t */
     BRIDGE_EVT_OTA_URL       = 0x83, /* payload: OTA 地址字符串 (可空, 空表示未配置) */
+    BRIDGE_EVT_WIFI_RESET_DONE = 0x84, /* WIFI_RESET 的应答: 凭据已清除, C5 即将重启 */
+    BRIDGE_EVT_REBOOT_REQUEST  = 0x85, /* 配网成功: C5 通知 S3 立即重启, 随后 C5 自己也重启 */
+    /* payload: count(1) + count×{ rssi(int8), authmode(1), ssid_len(1), ssid[ssid_len] }
+     * 按 RSSI 降序, 已去重 (同 SSID 只保留最强的一个 BSS)。 */
+    BRIDGE_EVT_WIFI_SCAN_RESULT   = 0x86,
+    /* CMD_WIFI_CONFIG 的结果。payload: ok(1) + 其余字节为 UTF-8 错误文案 (ok=1 时为空)。
+     * 注意 C5 在这里只回结果不重启 —— 失败要让用户能在 S3 的配网页上重填, 热点必须还在。 */
+    BRIDGE_EVT_WIFI_CONFIG_RESULT = 0x87,
+    /* C5 启动时发现没有任何已保存凭据, 通知 S3 开配网热点。payload: 空。 */
+    BRIDGE_EVT_NEED_PROVISION     = 0x88,
     BRIDGE_EVT_SOCK_OPENED   = 0x90, /* payload: bridge_sock_result_t (link_id 在帧头) */
     BRIDGE_EVT_SOCK_DATA     = 0x91, /* payload: 原始数据 */
     BRIDGE_EVT_SOCK_CLOSED   = 0x92, /* 远端关闭或出错 */

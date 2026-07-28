@@ -7,6 +7,8 @@
 
 #include <driver/uart.h>
 #include <esp_log.h>
+#include <esp_system.h>
+#include <freertos/task.h>
 
 #define TAG "C5Bridge"
 
@@ -14,6 +16,10 @@
 #define EV_WIFI_CONNECTED  BIT1
 #define EV_OTA_URL         BIT2
 #define EV_PONG            BIT3
+#define EV_WIFI_RESET_DONE BIT4
+#define EV_SCAN_RESULT     BIT5
+#define EV_CONFIG_RESULT   BIT6
+#define EV_NEED_PROVISION  BIT7
 
 /* 查表法 CRC16-CCITT, 复用 bridge_protocol.h 中的实现 (与 C5 端一致) */
 static inline uint16_t crc16_ccitt(const uint8_t* data, size_t len, uint16_t crc)
@@ -221,6 +227,70 @@ void C5Bridge::DispatchFrame(uint8_t type, uint8_t link_id, const uint8_t* paylo
         break;
     }
 
+    case BRIDGE_EVT_REBOOT_REQUEST:
+        // C5 配网完成, 它即将带着新凭据重启。S3 现在的网络状态(socket/IP)全部
+        // 失效, 且 StartNetwork 已经跑完不会再等, 所以只能重启重新走一遍。
+        ESP_LOGW(TAG, "C5 requested reboot (provisioning done), restarting S3");
+        vTaskDelay(pdMS_TO_TICKS(200));
+        esp_restart();
+        break;
+
+    case BRIDGE_EVT_WIFI_RESET_DONE:
+        xEventGroupSetBits(events_, EV_WIFI_RESET_DONE);
+        ESP_LOGW(TAG, "C5 wifi credentials cleared, C5 is rebooting to config mode");
+        break;
+
+    case BRIDGE_EVT_NEED_PROVISION:
+        // C5 每 5 秒重发一次 (防止开机时序竞态丢帧), 这里只在状态翻转时打日志,
+        // 否则会把串口刷满。
+        if (!needs_provision_) {
+            ESP_LOGW(TAG, "C5 has no usable credentials, S3 should start provisioning AP");
+        }
+        needs_provision_ = true;
+        xEventGroupSetBits(events_, EV_NEED_PROVISION);
+        break;
+
+    case BRIDGE_EVT_WIFI_SCAN_RESULT: {
+        // payload: count(1) + count×{ rssi(i8), authmode(1), ssid_len(1), ssid[] }
+        std::vector<C5ApInfo> list;
+        if (len >= 1) {
+            uint8_t count = payload[0];
+            size_t off = 1;
+            for (uint8_t i = 0; i < count; i++) {
+                if (off + 3 > len) break;
+                C5ApInfo ap;
+                ap.rssi = (int8_t)payload[off];
+                ap.authmode = payload[off + 1];
+                uint8_t sl = payload[off + 2];
+                off += 3;
+                if (off + sl > len) break;
+                ap.ssid.assign((const char*)payload + off, sl);
+                off += sl;
+                list.push_back(std::move(ap));
+            }
+        }
+        {
+            std::lock_guard<std::mutex> lk(scan_mutex_);
+            scan_results_ = std::move(list);
+        }
+        xEventGroupSetBits(events_, EV_SCAN_RESULT);
+        break;
+    }
+
+    case BRIDGE_EVT_WIFI_CONFIG_RESULT: {
+        // payload: ok(1) + 其余字节为错误文案
+        std::lock_guard<std::mutex> lk(config_mutex_);
+        config_ok_ = (len >= 1 && payload[0] == 1);
+        config_error_.clear();
+        if (!config_ok_ && len > 1) {
+            config_error_.assign((const char*)payload + 1, len - 1);
+        }
+        xEventGroupSetBits(events_, EV_CONFIG_RESULT);
+        ESP_LOGI(TAG, "wifi config result: ok=%d err=%s",
+                 config_ok_ ? 1 : 0, config_error_.c_str());
+        break;
+    }
+
     case BRIDGE_EVT_LOG:
         ESP_LOGI("C5", "%.*s", (int)len, (const char*)payload);
         break;
@@ -317,6 +387,88 @@ void C5Bridge::RequestStatus() {
 
 void C5Bridge::RequestWifiStart() {
     SendFrame(BRIDGE_CMD_WIFI_CONNECT, BRIDGE_NO_LINK, nullptr, 0);
+}
+
+bool C5Bridge::ResetWifiCredentials(int timeout_ms) {
+    xEventGroupClearBits(events_, EV_WIFI_RESET_DONE);
+    if (!SendFrame(BRIDGE_CMD_WIFI_RESET, BRIDGE_NO_LINK, nullptr, 0)) {
+        return false;
+    }
+    EventBits_t bits = xEventGroupWaitBits(events_, EV_WIFI_RESET_DONE, pdTRUE, pdTRUE,
+                                           pdMS_TO_TICKS(timeout_ms));
+    if (!(bits & EV_WIFI_RESET_DONE)) {
+        ESP_LOGE(TAG, "wifi reset: no ack from C5 within %d ms", timeout_ms);
+        return false;
+    }
+    // C5 收到后会自行重启, 本端的 WiFi 状态立即失效
+    {
+        std::lock_guard<std::mutex> lk(status_mutex_);
+        wifi_connected_ = false;
+    }
+    xEventGroupClearBits(events_, EV_WIFI_CONNECTED);
+    return true;
+}
+
+bool C5Bridge::WaitForNetworkOrProvision(int timeout_ms) {
+    if (!c5_ready_) {
+        xEventGroupWaitBits(events_, EV_C5_READY, pdFALSE, pdFALSE, pdMS_TO_TICKS(10000));
+    }
+    // 两个结果任一到达就返回, 不必空等满超时:
+    // C5 一开机就知道自己有没有凭据, 没有的话会立刻发 NEED_PROVISION。
+    EventBits_t bits = xEventGroupWaitBits(events_, EV_WIFI_CONNECTED | EV_NEED_PROVISION,
+                                           pdFALSE, pdFALSE, pdMS_TO_TICKS(timeout_ms));
+    return (bits & EV_WIFI_CONNECTED) != 0;
+}
+
+bool C5Bridge::RequestScan(std::vector<C5ApInfo>& out, int timeout_ms) {
+    xEventGroupClearBits(events_, EV_SCAN_RESULT);
+    if (!SendFrame(BRIDGE_CMD_WIFI_SCAN, BRIDGE_NO_LINK, nullptr, 0)) {
+        return false;
+    }
+    EventBits_t bits = xEventGroupWaitBits(events_, EV_SCAN_RESULT, pdTRUE, pdTRUE,
+                                           pdMS_TO_TICKS(timeout_ms));
+    if (!(bits & EV_SCAN_RESULT)) {
+        ESP_LOGW(TAG, "scan: no result from C5 within %d ms", timeout_ms);
+        return false;
+    }
+    std::lock_guard<std::mutex> lk(scan_mutex_);
+    out = scan_results_;
+    return true;
+}
+
+bool C5Bridge::SendWifiConfig(const std::string& ssid, const std::string& password,
+                              std::string& error_out, int timeout_ms) {
+    if (ssid.empty() || ssid.size() > 32 || password.size() > 64) {
+        error_out = "SSID 或密码长度不合法";
+        return false;
+    }
+
+    // payload: ssid_len(1) + ssid + pwd_len(1) + pwd
+    std::vector<uint8_t> buf;
+    buf.push_back((uint8_t)ssid.size());
+    buf.insert(buf.end(), ssid.begin(), ssid.end());
+    buf.push_back((uint8_t)password.size());
+    buf.insert(buf.end(), password.begin(), password.end());
+
+    xEventGroupClearBits(events_, EV_CONFIG_RESULT);
+    if (!SendFrame(BRIDGE_CMD_WIFI_CONFIG, BRIDGE_NO_LINK, buf.data(), (uint16_t)buf.size())) {
+        error_out = "无法与 WiFi 模块通信";
+        return false;
+    }
+
+    EventBits_t bits = xEventGroupWaitBits(events_, EV_CONFIG_RESULT, pdTRUE, pdTRUE,
+                                           pdMS_TO_TICKS(timeout_ms));
+    if (!(bits & EV_CONFIG_RESULT)) {
+        error_out = "WiFi 模块无响应, 请重试";
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lk(config_mutex_);
+    if (!config_ok_) {
+        error_out = config_error_.empty() ? "连接失败" : config_error_;
+        return false;
+    }
+    return true;
 }
 
 bool C5Bridge::PingC5(int timeout_ms) {

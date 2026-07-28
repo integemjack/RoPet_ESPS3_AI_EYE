@@ -86,7 +86,22 @@ void DualNetworkBoard::SwitchNetworkType() {
     app.Reboot();
 }
 
- 
+void DualNetworkBoard::ResetWifiConfiguration() {
+    // 按当前网络类型下钻到具体板卡: current_board_ 的实际类型由 network_type_ 决定
+    // (见 InitializeCurrentBoard), 所以这里的 static_cast 是安全的。
+    switch (network_type_) {
+        case NetworkType::WIFI:
+            static_cast<WifiBoard&>(*current_board_).ResetWifiConfiguration();
+            break;
+        case NetworkType::C5:
+            static_cast<Esp32C5Board&>(*current_board_).ResetWifiConfiguration();
+            break;
+        default:
+            ESP_LOGW(TAG, "ResetWifiConfiguration ignored: current network is 4G");
+            break;
+    }
+}
+
 std::string DualNetworkBoard::GetBoardType() {
     return current_board_->GetBoardType();
 }

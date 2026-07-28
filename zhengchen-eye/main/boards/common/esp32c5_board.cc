@@ -7,6 +7,9 @@
 #include "assets/lang_config.h"
 
 #include <esp_log.h>
+#include <esp_system.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 #include <cJSON.h>
 
 static const char *TAG = "Esp32C5Board";
@@ -42,17 +45,44 @@ void Esp32C5Board::WaitForNetworkReady() {
     auto display = Board::GetInstance().GetDisplay();
     display->SetStatus(Lang::Strings::REGISTERING_NETWORK);
 
-    // 等 C5 完成 WiFi 连接 (含首次配网, 给足时间)
-    if (!bridge_.WaitForNetworkReady(120000)) {
-        application.Alert(Lang::Strings::ERROR, Lang::Strings::REG_ERROR, "sad", Lang::Sounds::P3_ERR_REG);
+    // 等 C5 上线, 或等它明确说"我没凭据"。后者会立刻返回, 不必空等满 120 秒。
+    if (bridge_.WaitForNetworkOrProvision(120000)) {
+        ESP_LOGI(TAG, "C5 WiFi ready, ip=%s rssi=%d band=%dG",
+                 bridge_.GetIpAddress().c_str(), bridge_.GetRssi(),
+                 bridge_.GetBand() == 2 ? 5 : 2);
         return;
     }
-    ESP_LOGI(TAG, "C5 WiFi ready, ip=%s rssi=%d band=%dG",
-             bridge_.GetIpAddress().c_str(), bridge_.GetRssi(),
-             bridge_.GetBand() == 2 ? 5 : 2);
 
-    // 从 C5 配网页取回单独配置的 OTA 地址, 同步到 S3 自己的 NVS。
-    SyncOtaUrlFromC5();
+    if (bridge_.needs_provision()) {
+        EnterProvisioningMode();
+        return;   // 不会返回, EnterProvisioningMode 内部常驻
+    }
+
+    application.Alert(Lang::Strings::ERROR, Lang::Strings::REG_ERROR, "sad", Lang::Sounds::P3_ERR_REG);
+}
+
+// 用 S3 自己那颗闲置的 2.4G 射频开配网热点。
+// 关键在于 S3 只做 AP、不做 STA, 信道固定, 手机全程不掉线; 真正的连接验证
+// 交给 C5 的射频去做, 两者互不干扰 —— 详见 c5_provision_portal.h。
+void Esp32C5Board::EnterProvisioningMode() {
+    auto& application = Application::GetInstance();
+    application.SetDeviceState(kDeviceStateWifiConfiguring);
+
+    portal_ = std::make_unique<C5ProvisionPortal>(bridge_);
+    portal_->Start("Xiaozhi");
+
+    std::string hint = Lang::Strings::CONNECT_TO_HOTSPOT;
+    hint += portal_->ssid();
+    hint += Lang::Strings::ACCESS_VIA_BROWSER;
+    hint += portal_->url();
+    hint += "\n\n";
+    application.Alert(Lang::Strings::WIFI_CONFIG_MODE, hint.c_str(), "",
+                      Lang::Sounds::P3_WIFICONFIG);
+
+    // 配网完成后由 /submit 的处理流程重启双方, 这里只需常驻
+    while (true) {
+        vTaskDelay(pdMS_TO_TICKS(10000));
+    }
 }
 
 // 规范化用户在配网页填写的 OTA 地址:
@@ -101,6 +131,25 @@ void Esp32C5Board::SyncOtaUrlFromC5() {
         settings.SetString("ota_url", "");
         ESP_LOGI(TAG, "C5 has no ota_url, cleared S3 setting (use default)");
     }
+}
+
+void Esp32C5Board::ResetWifiConfiguration() {
+    auto display = Board::GetInstance().GetDisplay();
+    display->ShowNotification(Lang::Strings::ENTERING_WIFI_CONFIG_MODE);
+
+    // WiFi 凭据保存在 C5 的 NVS 里, S3 本地没有可删的东西, 只能下发命令。
+    if (bridge_.ResetWifiCredentials(3000)) {
+        ESP_LOGW(TAG, "C5 acked wifi reset, rebooting S3");
+    } else {
+        // 没等到应答: C5 可能没跑新固件, 或串口异常。用 PING 区分这两种情况,
+        // 便于现场判断。无论哪种都继续重启, 避免卡在一个半死的网络状态。
+        ESP_LOGE(TAG, "C5 did not ack wifi reset (alive=%d), rebooting S3 anyway",
+                 bridge_.PingC5(1000) ? 1 : 0);
+    }
+
+    // C5 重启后会开配网热点; S3 也重启, 重新走 StartNetwork 等它上线。
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    esp_restart();
 }
 
 NetworkInterface* Esp32C5Board::GetNetwork() {

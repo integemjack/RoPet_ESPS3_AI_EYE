@@ -1,23 +1,33 @@
 /*
  * bridge_wifi.cc - C5 WiFi 管理
  *
- * 直接复用小智同款组件 78/esp-wifi-connect (与主工程 S3 同版本 2.4.3):
- *   - WifiStation        : 用 NVS 里存的凭据连 WiFi (全信道扫描, 优先信号最强 -> 可连 5G)
- *   - WifiConfigurationAp: 连不上时开 SoftAP + captive portal 配网网页 (与小智一模一样)
- *   - SsidManager        : 凭据持久化到 C5 的 NVS
+ * 角色变更 (重要):
+ * 以前 C5 自己开 SoftAP + captive portal 做配网。但 C5 是**单射频**: STA 一去
+ * 关联目标 AP (尤其 5G, 信道 128), 驱动就会把 SoftAP 强行拖到同一信道, 手机
+ * 立刻掉线数秒。实测手机会因此把配网页的 JS 冻结, 于是"验证结果"永远送不到
+ * 页面上 —— 试过同步等待、异步轮询、服务端状态注入、captive 探测重投, 全部
+ * 败在同一个根因上。
  *
- * 也就是把小智的配网网页"整套搬到 C5 上"。S3 不再参与 WiFi。
+ * 现在改成: **配网热点由 S3 的 2.4G 射频承载** (那颗射频在 C5 模式下本来闲置)。
+ * S3 出热点和配网页, 手机始终连在 S3 上、从头到尾不掉线; C5 这边不再有热点要
+ * 维持, 射频独占, 爱怎么换信道换信道。职责因此简化为三件事:
+ *   1. 扫描 5G 频段, 把 SSID 列表回传给 S3 (S3 的 2.4G 射频看不见 5G AP)
+ *   2. 用 S3 下发的凭据做一次真实连接验证, 把成功/失败原因回传
+ *   3. 验证通过才写 NVS, 之后用 WifiStation 正常连接
  *
- * 本文件的调用严格对齐主工程 main/boards/common/wifi_board.cc 中已验证可用的 API。
+ * 于是配网的"结果送达"变成一次普通的同步 HTTP 响应, 不再需要任何绕行设计。
  */
 #include "bridge_internal.h"   /* 头文件自带 extern "C" 守卫 */
 
 #include <string>
+#include <vector>
+#include <algorithm>
 #include <cstring>
 #include <cstdio>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/event_groups.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
 #include "esp_netif.h"
@@ -25,18 +35,21 @@
 #include "nvs_flash.h"
 
 #include "wifi_station.h"
-#include "wifi_configuration_ap.h"
 #include "ssid_manager.h"
 #include "nvs.h"
 
 static const char *TAG = "bridge_wifi";
 
-static bool s_config_mode = false;
+/* 处于"等待 S3 配网"状态: 已初始化射频但没有可用凭据, 只响应扫描/验证请求。 */
+static bool s_provisioning = false;
 
-/* 回读一次频段模式, 确认 2.4G + 5G 已生效 (纯诊断用, 不改变行为)。
- * 频段模式与国家码的设置已下沉到 components/esp-wifi-connect 内部
- * (WifiConfigurationAp::StartAccessPoint 与 WifiStation::Start), 那里才是
- * esp_wifi_start() 之后的正确时机。 */
+#define PROV_CONNECTED_BIT BIT0
+#define PROV_FAILED_BIT    BIT1
+static EventGroupHandle_t s_prov_events = nullptr;
+static volatile uint8_t s_prov_disconnect_reason = 0;
+static volatile bool s_prov_connecting = false;
+
+/* 回读一次频段模式, 确认 2.4G + 5G 已生效 (纯诊断用, 不改变行为)。 */
 static void bridge_wifi_log_band_mode(void)
 {
 #if CONFIG_SOC_WIFI_SUPPORT_5G
@@ -49,10 +62,8 @@ static void bridge_wifi_log_band_mode(void)
 
 extern "C" void bridge_wifi_init(void)
 {
-    /* 严格对齐主工程 S3 的启动模式 (main.cc): 只做 event loop + NVS。
-     * esp_netif_init / esp_wifi_init / netif 创建 均由 esp-wifi-connect 组件
-     * 内部完成 (S3 的 main.cc 同样没有显式调用), 这里不要重复初始化,
-     * 否则会触发 ESP_ERR_INVALID_STATE。 */
+    /* 只做 event loop + NVS。射频的初始化按状态分两条路走:
+     * 有凭据 -> WifiStation::Start() 内部初始化; 无凭据 -> 下面的配网模式自己初始化。 */
     esp_err_t ret = esp_event_loop_create_default();
     if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
         ESP_ERROR_CHECK(ret);
@@ -65,41 +76,87 @@ extern "C" void bridge_wifi_init(void)
     }
     ESP_ERROR_CHECK(ret);
 
-    ESP_LOGI(TAG, "nvs + event loop ready (wifi driver managed by component)");
+    ESP_LOGI(TAG, "nvs + event loop ready");
 }
 
-/* 进入配网模式: 开热点 + 网页, 等价于小智 WifiBoard::EnterWifiConfigMode */
-static void enter_config_mode()
+/* 配网模式下的 STA 事件: 只用来驱动"验证"这一件事的成败判定。 */
+static void prov_wifi_event_handler(void* arg, esp_event_base_t base,
+                                    int32_t id, void* data)
 {
-    s_config_mode = true;
+    if (id == WIFI_EVENT_STA_DISCONNECTED) {
+        auto* ev = static_cast<wifi_event_sta_disconnected_t*>(data);
+        s_prov_disconnect_reason = ev->reason;
 
-    auto &wifi_ap = WifiConfigurationAp::GetInstance();
-    wifi_ap.SetLanguage("zh-CN");
-    wifi_ap.SetSsidPrefix("Xiaozhi");
-    // 注意: esp-wifi-connect 2.4.3 的配网页默认就显示 OTA 地址输入框,
-    // 无需额外开关。用户填写后会存入 C5 NVS 的 wifi.ota_url。
-    wifi_ap.Start();
+        if (!s_prov_connecting) {
+            return;   /* 验证结束后我们自己断开的, 不要触发重连 */
+        }
 
+        /* 只有"确定性失败"才立即判负。双频同名 SSID 时驱动会先在 2.4G 上
+         * auth 失败再切到 5G, 那种瞬时失败必须继续等, 否则明明能连上却被判失败。 */
+        bool fatal = (ev->reason == WIFI_REASON_AUTH_FAIL ||
+                      ev->reason == WIFI_REASON_NO_AP_FOUND ||
+                      ev->reason == WIFI_REASON_HANDSHAKE_TIMEOUT ||
+                      ev->reason == WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT);
+        ESP_LOGW(TAG, "provision STA disconnected, reason=%d (%s)", ev->reason,
+                 fatal ? "fatal" : "retryable");
+        if (fatal) {
+            xEventGroupSetBits(s_prov_events, PROV_FAILED_BIT);
+        } else {
+            esp_wifi_connect();
+        }
+    }
+}
+
+static void prov_ip_event_handler(void* arg, esp_event_base_t base,
+                                  int32_t id, void* data)
+{
+    if (id == IP_EVENT_STA_GOT_IP) {
+        xEventGroupSetBits(s_prov_events, PROV_CONNECTED_BIT);
+    }
+}
+
+/* 进入"等待 S3 配网"状态: 纯 STA 模式起射频, 不开任何热点。 */
+static void enter_provision_mode()
+{
+    s_provisioning = true;
+    s_prov_events = xEventGroupCreate();
+
+    ESP_ERROR_CHECK(esp_netif_init());
+    esp_netif_create_default_wifi_sta();
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(
+        WIFI_EVENT, ESP_EVENT_ANY_ID, &prov_wifi_event_handler, nullptr, nullptr));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(
+        IP_EVENT, IP_EVENT_STA_GOT_IP, &prov_ip_event_handler, nullptr, nullptr));
+
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
+    ESP_ERROR_CHECK(esp_wifi_start());
+
+#ifdef CONFIG_SOC_WIFI_SUPPORT_5G
+    /* 顺序不能反: 先切频段模式再设国家码, 否则国家码只会应用到 2.4G。
+     * "01" = world safe mode, 配合 802.11d 跟随所连 AP 的 country IE。 */
+    ESP_ERROR_CHECK(esp_wifi_set_band_mode(WIFI_BAND_MODE_AUTO));
+    ESP_ERROR_CHECK(esp_wifi_set_country_code("01", true));
+#endif
     bridge_wifi_log_band_mode();
 
-    bridge_log("C5 WiFi config mode. hotspot: %s url: %s",
-               wifi_ap.GetSsid().c_str(), wifi_ap.GetWebServerUrl().c_str());
-    ESP_LOGI(TAG, "config AP: %s  %s",
-             wifi_ap.GetSsid().c_str(), wifi_ap.GetWebServerUrl().c_str());
+    /* 告诉 S3: 我没凭据, 请开配网热点 */
+    bridge_send_frame(BRIDGE_EVT_NEED_PROVISION, BRIDGE_NO_LINK, NULL, 0);
+    bridge_log("C5 has no wifi credentials, S3 please start provisioning AP");
+    ESP_LOGW(TAG, "no saved ssid -> provisioning mode (waiting for S3)");
 
-    /* 上报一次状态: 未连接, 让 S3 屏幕显示"配网中"。
-     * 配网完成后组件内部会重启设备, 无需在此轮询。 */
     bridge_wifi_report_status();
 }
 
 extern "C" void bridge_wifi_start(void)
 {
-    /* 没有任何已保存的 SSID -> 直接进配网 */
     auto &ssid_manager = SsidManager::GetInstance();
-    auto ssid_list = ssid_manager.GetSsidList();
-    if (ssid_list.empty()) {
-        ESP_LOGW(TAG, "no saved ssid, enter config mode");
-        enter_config_mode();
+    if (ssid_manager.GetSsidList().empty()) {
+        enter_provision_mode();
         return;
     }
 
@@ -112,11 +169,12 @@ extern "C" void bridge_wifi_start(void)
 
     bridge_wifi_log_band_mode();
 
-    /* 等待连接; 失败则进配网 (逻辑同 WifiBoard::StartNetwork) */
     if (!wifi_station.WaitForConnected(60 * 1000)) {
         wifi_station.Stop();
-        ESP_LOGW(TAG, "connect timeout, enter config mode");
-        enter_config_mode();
+        ESP_LOGW(TAG, "connect timeout with saved credentials");
+        /* 凭据存在但连不上 (换了路由器/改了密码): 同样请 S3 开配网热点,
+         * 让用户能重新配。这里不清除旧凭据, 配网成功时会被覆盖。 */
+        bridge_send_frame(BRIDGE_EVT_NEED_PROVISION, BRIDGE_NO_LINK, NULL, 0);
         return;
     }
 
@@ -126,14 +184,185 @@ extern "C" void bridge_wifi_start(void)
 
 extern "C" bool bridge_wifi_is_connected(void)
 {
-    if (s_config_mode) return false;
+    if (s_provisioning) return false;
     return WifiStation::GetInstance().IsConnected();
+}
+
+extern "C" bool bridge_wifi_is_provisioning(void)
+{
+    return s_provisioning;
+}
+
+extern "C" void bridge_wifi_announce_provision(void)
+{
+    if (!s_provisioning) return;
+    bridge_send_frame(BRIDGE_EVT_NEED_PROVISION, BRIDGE_NO_LINK, NULL, 0);
+}
+
+/* 扫描 5G 频段并把结果回传 S3。
+ * 只扫 5G: 本产品固定用 5G, 而且 S3 的 2.4G 射频自己就能看见 2.4G,
+ * 混在一起只会让用户误选到连不上的 2.4G 同名 SSID。 */
+extern "C" void bridge_wifi_scan_and_report(void)
+{
+    if (!s_provisioning) {
+        ESP_LOGW(TAG, "scan requested but not in provisioning mode");
+    }
+
+    wifi_scan_config_t scan_config = {};
+#ifdef CONFIG_SOC_WIFI_SUPPORT_5G
+    scan_config.channel = 0;   /* 0 才会启用下面的 bitmap */
+    scan_config.channel_bitmap.ghz_2_channels = 0;
+    scan_config.channel_bitmap.ghz_5_channels =
+        WIFI_CHANNEL_36  | WIFI_CHANNEL_40  | WIFI_CHANNEL_44  | WIFI_CHANNEL_48  |
+        WIFI_CHANNEL_52  | WIFI_CHANNEL_56  | WIFI_CHANNEL_60  | WIFI_CHANNEL_64  |
+        WIFI_CHANNEL_100 | WIFI_CHANNEL_104 | WIFI_CHANNEL_108 | WIFI_CHANNEL_112 |
+        WIFI_CHANNEL_116 | WIFI_CHANNEL_120 | WIFI_CHANNEL_124 | WIFI_CHANNEL_128 |
+        WIFI_CHANNEL_132 | WIFI_CHANNEL_136 | WIFI_CHANNEL_140 | WIFI_CHANNEL_144 |
+        WIFI_CHANNEL_149 | WIFI_CHANNEL_153 | WIFI_CHANNEL_157 | WIFI_CHANNEL_161 |
+        WIFI_CHANNEL_165 | WIFI_CHANNEL_169 | WIFI_CHANNEL_173 | WIFI_CHANNEL_177;
+#endif
+
+    esp_err_t err = esp_wifi_scan_start(&scan_config, true);   /* 阻塞扫描 */
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "scan failed: %s", esp_err_to_name(err));
+        uint8_t zero = 0;
+        bridge_send_frame(BRIDGE_EVT_WIFI_SCAN_RESULT, BRIDGE_NO_LINK, &zero, 1);
+        return;
+    }
+
+    uint16_t ap_num = 0;
+    esp_wifi_scan_get_ap_num(&ap_num);
+    if (ap_num == 0) {
+        uint8_t zero = 0;
+        bridge_send_frame(BRIDGE_EVT_WIFI_SCAN_RESULT, BRIDGE_NO_LINK, &zero, 1);
+        return;
+    }
+    std::vector<wifi_ap_record_t> records(ap_num);
+    esp_wifi_scan_get_ap_records(&ap_num, records.data());
+    records.resize(ap_num);
+
+    std::sort(records.begin(), records.end(),
+              [](const wifi_ap_record_t& a, const wifi_ap_record_t& b) {
+                  return a.rssi > b.rssi;
+              });
+
+    /* 同 SSID 只保留信号最强的那个 BSS, 免得配网页列出一堆重复项 */
+    std::vector<uint8_t> payload;
+    payload.push_back(0);   /* count 占位 */
+    uint8_t count = 0;
+    std::vector<std::string> seen;
+    for (const auto& r : records) {
+        std::string ssid(reinterpret_cast<const char*>(r.ssid));
+        if (ssid.empty()) continue;
+        if (std::find(seen.begin(), seen.end(), ssid) != seen.end()) continue;
+        /* 单帧上限 4096, 每条最多 3 + 32 字节, 留足余量后封顶 40 条 */
+        if (count >= 40) break;
+        seen.push_back(ssid);
+
+        payload.push_back(static_cast<uint8_t>(r.rssi));
+        payload.push_back(static_cast<uint8_t>(r.authmode));
+        payload.push_back(static_cast<uint8_t>(ssid.size()));
+        payload.insert(payload.end(), ssid.begin(), ssid.end());
+        count++;
+    }
+    payload[0] = count;
+
+    ESP_LOGI(TAG, "scan done, report %d ssid(s) to S3", count);
+    bridge_send_frame(BRIDGE_EVT_WIFI_SCAN_RESULT, BRIDGE_NO_LINK,
+                      payload.data(), static_cast<uint16_t>(payload.size()));
+}
+
+/* 回传验证结果。ok=0 时附带错误文案 (UTF-8, 直接显示在 S3 的配网页上)。 */
+static void report_config_result(bool ok, const char* err)
+{
+    uint8_t buf[128];
+    buf[0] = ok ? 1 : 0;
+    size_t n = 0;
+    if (!ok && err) {
+        n = strlen(err);
+        if (n > sizeof(buf) - 1) n = sizeof(buf) - 1;
+        memcpy(buf + 1, err, n);
+    }
+    bridge_send_frame(BRIDGE_EVT_WIFI_CONFIG_RESULT, BRIDGE_NO_LINK,
+                      buf, static_cast<uint16_t>(1 + n));
+}
+
+/* 用 S3 下发的凭据做一次真实连接验证。
+ * 成功才写 NVS —— 这样"保存的凭据"永远是验证过的。
+ * 注意: 无论成败都不在这里重启; 失败要让用户在 S3 的配网页上重填,
+ * 成功后的重启时序由 S3 统一编排 (它要先把 HTTP 响应发给手机)。 */
+extern "C" void bridge_wifi_try_config(const char* ssid, const char* password)
+{
+    if (!s_provisioning) {
+        report_config_result(false, "设备不在配网状态");
+        return;
+    }
+    if (!ssid || ssid[0] == '\0') {
+        report_config_result(false, "SSID 不能为空");
+        return;
+    }
+
+    ESP_LOGI(TAG, "verifying credentials for %s", ssid);
+    esp_wifi_scan_stop();
+    xEventGroupClearBits(s_prov_events, PROV_CONNECTED_BIT | PROV_FAILED_BIT);
+    s_prov_disconnect_reason = 0;
+
+    wifi_config_t wifi_config = {};
+    strncpy(reinterpret_cast<char*>(wifi_config.sta.ssid), ssid,
+            sizeof(wifi_config.sta.ssid) - 1);
+    strncpy(reinterpret_cast<char*>(wifi_config.sta.password), password ? password : "",
+            sizeof(wifi_config.sta.password) - 1);
+    wifi_config.sta.scan_method = WIFI_ALL_CHANNEL_SCAN;
+    /* 双频同名时驱动要先试完 2.4G 的 BSS 才会切到 5G, 重试次数太少会提前放弃 */
+    wifi_config.sta.failure_retry_cnt = 3;
+    wifi_config.sta.sort_method = WIFI_CONNECT_AP_BY_SIGNAL;
+
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+
+    s_prov_connecting = true;
+    esp_err_t err = esp_wifi_connect();
+    if (err != ESP_OK) {
+        s_prov_connecting = false;
+        report_config_result(false, "无法发起连接");
+        return;
+    }
+
+    /* 等 15s: 双频同名 SSID 的换频段过程叠加重试后可能接近 10s */
+    EventBits_t bits = xEventGroupWaitBits(s_prov_events,
+                                           PROV_CONNECTED_BIT | PROV_FAILED_BIT,
+                                           pdTRUE, pdFALSE, pdMS_TO_TICKS(15000));
+    s_prov_connecting = false;
+
+    if (bits & PROV_CONNECTED_BIT) {
+        ESP_LOGI(TAG, "credentials verified, saving %s", ssid);
+        SsidManager::GetInstance().AddSsid(ssid, password ? password : "");
+        report_config_result(true, nullptr);
+        /* 保持连接状态: S3 收到成功后会安排双方重启, 重启后正常走 WifiStation */
+        return;
+    }
+
+    esp_wifi_disconnect();
+    const char* reason = (s_prov_disconnect_reason == WIFI_REASON_NO_AP_FOUND)
+                             ? "找不到该 WiFi, 请确认名称和信号"
+                             : "连接失败, 请检查密码";
+    ESP_LOGW(TAG, "verify failed for %s (reason=%d)", ssid, s_prov_disconnect_reason);
+    report_config_result(false, reason);
+}
+
+extern "C" void bridge_wifi_reset_credentials(void)
+{
+    auto &ssid_manager = SsidManager::GetInstance();
+    size_t before = ssid_manager.GetSsidList().size();
+    ssid_manager.Clear();
+
+    ESP_LOGW(TAG, "wifi credentials cleared (%u entries removed)", (unsigned)before);
+    bridge_log("C5 wifi credentials cleared (%u entries), rebooting", (unsigned)before);
 }
 
 extern "C" void bridge_wifi_report_ota_url(void)
 {
-    /* 从 C5 的 NVS wifi.ota_url 读取配网页保存的 OTA 地址, 回传 S3。
-     * esp-wifi-connect 的配网页 /advanced/submit 会写入这个 key。 */
+    /* 保留接口以兼容旧 S3 固件。新流程里 OTA 地址由 S3 的配网页直接存在 S3 的
+     * NVS 上, 不再需要从 C5 同步。 */
     char ota_url[256] = {0};
     size_t len = sizeof(ota_url);
     nvs_handle_t nvs;
@@ -143,12 +372,11 @@ extern "C" void bridge_wifi_report_ota_url(void)
         nvs_close(nvs);
     }
     if (err != ESP_OK) {
-        ota_url[0] = '\0';   /* 未配置: 回传空字符串 */
+        ota_url[0] = '\0';
         len = 0;
     } else {
         len = strlen(ota_url);
     }
-    ESP_LOGI(TAG, "report ota_url: '%s'", ota_url);
     bridge_send_frame(BRIDGE_EVT_OTA_URL, BRIDGE_NO_LINK,
                       (const uint8_t *)ota_url, (uint16_t)len);
 }
@@ -158,8 +386,7 @@ extern "C" void bridge_wifi_report_status(void)
     bridge_wifi_status_t st;
     memset(&st, 0, sizeof(st));
 
-    if (s_config_mode) {
-        /* 配网中: connected=0, band=0 */
+    if (s_provisioning) {
         bridge_send_frame(BRIDGE_EVT_WIFI_STATUS, BRIDGE_NO_LINK,
                           (const uint8_t *)&st, sizeof(st));
         return;
@@ -172,9 +399,8 @@ extern "C" void bridge_wifi_report_status(void)
     if (connected) {
         st.rssi = wifi_station.GetRssi();
         uint8_t ch = wifi_station.GetChannel();
-        st.band = (ch > 14) ? 2 : 1;   /* 信道 > 14 判定为 5GHz */
+        st.band = (ch > 14) ? 2 : 1;
 
-        /* 解析 IP 字符串 (点分十进制) */
         std::string ip = wifi_station.GetIpAddress();
         unsigned a = 0, b = 0, c = 0, d = 0;
         if (sscanf(ip.c_str(), "%u.%u.%u.%u", &a, &b, &c, &d) == 4) {

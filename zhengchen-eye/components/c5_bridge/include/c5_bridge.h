@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <cstddef>
 #include <string>
+#include <vector>
 #include <functional>
 #include <mutex>
 
@@ -24,6 +25,13 @@
 #include <freertos/event_groups.h>
 
 #include "bridge_protocol.h"
+
+// C5 扫描回来的一个 AP (S3 只有 2.4G 射频, 看不见 5G, 列表必须由 C5 提供)
+struct C5ApInfo {
+    std::string ssid;
+    int8_t      rssi = 0;
+    uint8_t     authmode = 0;
+};
 
 // 每条逻辑连接 (socket) 的回调集合
 struct C5Link {
@@ -78,6 +86,29 @@ public:
     void RequestStatus();
     void RequestWifiStart();
 
+    // 让 C5 清除已保存的 WiFi 凭据并重启。
+    // 返回 true 表示收到 C5 的确认应答; false 表示超时 (C5 未响应或固件过旧)。
+    bool ResetWifiCredentials(int timeout_ms = 3000);
+
+    // ---- 配网 (热点和网页在 S3 这边, C5 只做扫描和验证) ----
+
+    // C5 是否报告过"我没有可用凭据, 请开配网热点"。
+    bool needs_provision() const { return needs_provision_; }
+
+    // 等待 C5 上线或明确要求配网。返回 true = 已联网; false = 需要配网或超时。
+    // 比单纯等联网更快: C5 一开机就知道自己有没有凭据, 不必空等 120 秒。
+    bool WaitForNetworkOrProvision(int timeout_ms = 120000);
+
+    // 请求 C5 扫描 5G 频段。阻塞直到拿到结果或超时。
+    bool RequestScan(std::vector<C5ApInfo>& out, int timeout_ms = 15000);
+
+    // 把凭据下发给 C5 做真实连接验证。阻塞等待结果。
+    // 返回 true = 验证通过且 C5 已保存; false 时 error_out 为可直接展示的中文原因。
+    // 因为热点在 S3 自己的射频上、不受 C5 换信道影响, 这里同步等待是安全的 ——
+    // 手机与配网页的连接全程不会断。
+    bool SendWifiConfig(const std::string& ssid, const std::string& password,
+                        std::string& error_out, int timeout_ms = 25000);
+
     // 探活: 发 PING 等 PONG, 返回 true 表示 C5 活着并响应。
     // 用于区分"C5 未就绪/接线问题"和"C5 活着但某帧丢失"。
     bool PingC5(int timeout_ms = 1000);
@@ -119,9 +150,17 @@ private:
     uint8_t wifi_ip_[4] = {0,0,0,0};
     mutable std::mutex status_mutex_;
 
-    // OTA 地址 (从 C5 配网页取回)
+    // OTA 地址 (旧流程从 C5 配网页取回; 新流程改由 S3 的配网页直接存在 S3 NVS)
     std::string ota_url_;
     std::mutex  ota_url_mutex_;
+
+    // 配网相关
+    volatile bool needs_provision_ = false;
+    std::vector<C5ApInfo> scan_results_;
+    std::mutex  scan_mutex_;
+    bool        config_ok_ = false;
+    std::string config_error_;
+    std::mutex  config_mutex_;
 };
 
 #endif // C5_BRIDGE_H
