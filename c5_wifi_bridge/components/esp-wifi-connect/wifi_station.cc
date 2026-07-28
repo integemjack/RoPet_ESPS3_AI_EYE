@@ -145,8 +145,23 @@ void WifiStation::HandleScanResult() {
     esp_wifi_scan_get_ap_num(&ap_num);
     wifi_ap_record_t *ap_records = (wifi_ap_record_t *)malloc(ap_num * sizeof(wifi_ap_record_t));
     esp_wifi_scan_get_ap_records(&ap_num, ap_records);
-    // sort by rssi descending
+    // [本地修改] 排序规则: 先 5GHz, 同频段内再按 RSSI 降序。
+    //
+    // 上游只按 RSSI 排。但双频路由器通常用同一个 SSID 同时广播 2.4G 和 5G,
+    // 而 2.4G 穿透好、RSSI 往往更高, 于是队列里 2.4G 的 BSS 排在前面。
+    // 实测某些路由器的 2.4G BSS 会直接拒绝认证 (Disconnected reason=202),
+    // 每次尝试约 10s, 要试满 MAX_RECONNECT_COUNT 才轮到 5G ——
+    // 开机联网因此多花 30s 以上, S3 那边就表现为"等很久才连上网"。
+    //
+    // 本产品的配网页只扫 5GHz 信道, 用户选中的 SSID 必然有可用的 5G BSS,
+    // 所以优先试 5G 是安全的; 2.4G 仍留在队列里做兜底, 只是不再排在前面。
+    // (2.4G 信道号 1~14, 5G 远大于 14)
     std::sort(ap_records, ap_records + ap_num, [](const wifi_ap_record_t& a, const wifi_ap_record_t& b) {
+        bool a_is_5g = a.primary > 14;
+        bool b_is_5g = b.primary > 14;
+        if (a_is_5g != b_is_5g) {
+            return a_is_5g;
+        }
         return a.rssi > b.rssi;
     });
 
