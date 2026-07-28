@@ -30,17 +30,23 @@ static const char *TAG = "servo";
 
 /* ---------------- 硬件参数 ---------------- */
 
-/* XIAO ESP32C5 引脚。已避开:
+/* XIAO ESP32C5 引脚: 四肢排 D0~D3, 尾巴 D5, D4 空着备用。
+ *
+ * 必须避开的:
  *   D9=GPIO9 / D10=GPIO10  网桥 UART (bridge_internal.h)
- *   GPIO13/14              USB D-/D+, 动了就烧不进去
- *   D2=GPIO25, D3=GPIO7    C5 strapping 脚 (还有 26/27/28 未引出),
- *                          舵机线上电抖动可能把芯片带进错误启动模式或开 JTAG
- * 留空备用: D1=GPIO0, D2=GPIO25, D3=GPIO7, D8=GPIO8 */
+ *   GPIO13/14              USB D-/D+, 动了就烧不进去 (XIAO 上未引出)
+ *
+ * D2=GPIO25 和 D3=GPIO7 是 strapping 脚, 但都不参与启动模式 (C5 的启动模式
+ * 由 GPIO26/27/28 决定, XIAO 上没引出), 所以能用:
+ *   GPIO25 -> SDIO 采样/驱动时钟沿, 本工程不用 SDIO slave, 无影响
+ *   GPIO7  -> JTAG 信号源选择, 最坏情况是复位瞬间干扰 C5 自己的 USB-JTAG 调试
+ *
+ * 剩余可用: D4=GPIO23, D6=GPIO11, D7=GPIO12, D8=GPIO8 */
 #define SERVO_GPIO_FRONT_LEFT   1    /* D0 */
-#define SERVO_GPIO_FRONT_RIGHT  12   /* D7 */
-#define SERVO_GPIO_REAR_LEFT    23   /* D4 */
-#define SERVO_GPIO_REAR_RIGHT   24   /* D5 */
-#define SERVO_GPIO_TAIL         11   /* D6 */
+#define SERVO_GPIO_FRONT_RIGHT  0    /* D1 */
+#define SERVO_GPIO_REAR_LEFT    25   /* D2 */
+#define SERVO_GPIO_REAR_RIGHT   7    /* D3 */
+#define SERVO_GPIO_TAIL         24   /* D5 */
 
 #define SERVO_PWM_FREQ_HZ       50
 #define SERVO_PWM_RES           LEDC_TIMER_14_BIT

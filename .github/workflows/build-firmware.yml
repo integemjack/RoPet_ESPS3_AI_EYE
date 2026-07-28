@@ -1,13 +1,18 @@
 name: Build & Release Firmware
 
-# push 到主分支即自动构建 zhengchen-eye S3 主固件与 C5 WiFi Bridge 固件 (ESP-IDF v5.5.2),
+# push 到任意分支即自动构建 zhengchen-eye S3 主固件与 C5 WiFi Bridge 固件 (ESP-IDF v5.5.2),
 # 版本号从 zhengchen-eye/CMakeLists.txt 的 PROJECT_VER 读取, 自动创建 tag 并发布到 Release,
 # 无需手动打 tag。
+#
+# 主分支 (main/master) -> 正式 Release,  tag v<VER>,                标题 v<VER>
+# 其它分支             -> Prerelease,    tag v<VER>-<分支名slug>,   标题 v<VER> (分支名)
+#
+# 每个分支的 tag 互相独立, 所以同一个 PROJECT_VER 在不同分支上各发一次互不冲突;
+# 同一分支上版本没变则跳过 (本项目约定每次提交都递增 PROJECT_VER 补丁号)。
 on:
   push:
     branches:
-      - main
-      - master
+      - '**'
   workflow_dispatch:
 
 permissions:
@@ -17,7 +22,11 @@ jobs:
   version:
     runs-on: ubuntu-latest
     outputs:
-      version: ${{ steps.get.outputs.version }}
+      version: ${{ steps.get.outputs.version }}      # 纯版本号, 如 1.8.18
+      label: ${{ steps.get.outputs.label }}          # 文件名用, 如 1.8.18 或 1.8.18-feat-xxx
+      tag: ${{ steps.get.outputs.tag }}
+      title: ${{ steps.get.outputs.title }}
+      prerelease: ${{ steps.get.outputs.prerelease }}
       changed: ${{ steps.get.outputs.changed }}
     steps:
       - name: Checkout
@@ -26,7 +35,7 @@ jobs:
           fetch-depth: 0
           fetch-tags: true
 
-      - name: Read PROJECT_VER and check tag
+      - name: Read PROJECT_VER and resolve release identity
         id: get
         shell: bash
         run: |
@@ -36,15 +45,40 @@ jobs:
             echo "无法从 zhengchen-eye/CMakeLists.txt 读取 PROJECT_VER"
             exit 1
           fi
-          echo "version=$VER" >> "$GITHUB_OUTPUT"
-          echo "Project version: v$VER"
-          # 若 tag v$VER 已存在, 说明版本未变化, 跳过构建与发布
-          if git rev-parse -q --verify "refs/tags/v$VER" >/dev/null; then
+
+          BRANCH="${GITHUB_REF_NAME}"
+          if [ "$BRANCH" = "main" ] || [ "$BRANCH" = "master" ]; then
+            LABEL="$VER"
+            TAG="v$VER"
+            TITLE="v$VER"
+            PRERELEASE=false
+          else
+            # 分支名可能含 '/' 等字符, 转成 tag / 文件名安全的 slug
+            SLUG=$(printf '%s' "$BRANCH" | sed 's#[^A-Za-z0-9._-]#-#g')
+            LABEL="$VER-$SLUG"
+            TAG="v$VER-$SLUG"
+            TITLE="v$VER ($BRANCH)"
+            PRERELEASE=true
+          fi
+
+          {
+            echo "version=$VER"
+            echo "label=$LABEL"
+            echo "tag=$TAG"
+            echo "title=$TITLE"
+            echo "prerelease=$PRERELEASE"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "分支: $BRANCH"
+          echo "版本: v$VER   tag: $TAG   prerelease: $PRERELEASE"
+
+          # 若该 tag 已存在, 说明这个分支上的这个版本已经发过, 跳过构建与发布
+          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
-            echo "tag v$VER 已存在, 版本未变化, 跳过构建。"
+            echo "tag $TAG 已存在, 版本未变化, 跳过构建。"
           else
             echo "changed=true" >> "$GITHUB_OUTPUT"
-            echo "检测到新版本 v$VER, 将构建并发布。"
+            echo "检测到新版本 $TAG, 将构建并发布。"
           fi
 
   build:
@@ -104,14 +138,14 @@ jobs:
         shell: bash
         run: |
           mkdir -p dist
-          cp zhengchen-eye/build/merged-binary.bin "dist/v${{ needs.version.outputs.version }}_${{ matrix.name }}.bin"
+          cp zhengchen-eye/build/merged-binary.bin "dist/v${{ needs.version.outputs.label }}_${{ matrix.name }}.bin"
 
       - name: Collect C5 artifact
         if: matrix.kind == 'c5'
         shell: bash
         run: |
           mkdir -p dist
-          cp c5_wifi_bridge/build/merged-binary.bin "dist/v${{ needs.version.outputs.version }}_${{ matrix.name }}.bin"
+          cp c5_wifi_bridge/build/merged-binary.bin "dist/v${{ needs.version.outputs.label }}_${{ matrix.name }}.bin"
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
@@ -150,7 +184,7 @@ jobs:
       - name: Verify bundled firmwares
         shell: bash
         run: |
-          VER="${{ needs.version.outputs.version }}"
+          VER="${{ needs.version.outputs.label }}"
           ls -l scripts/flasher/firmware
           for f in "v${VER}_zhengchen_eye.bin" "v${VER}_c5-wifi-bridge.bin"; do
             if [ ! -f "scripts/flasher/firmware/$f" ]; then
@@ -167,7 +201,7 @@ jobs:
           # esptool 在进程内调用, 需连同其数据文件和动态子模块一起打包 (--collect-all)
           # --add-data 把本版本的 S3 / C5 固件打进 exe (运行时解压到 _MEIPASS/firmware)
           pyinstaller --noconsole --onefile \
-            --name "RoPet-Flasher-v${{ needs.version.outputs.version }}" \
+            --name "RoPet-Flasher-v${{ needs.version.outputs.label }}" \
             --paths scripts/flasher \
             --hidden-import _version \
             --collect-all esptool \
@@ -195,8 +229,9 @@ jobs:
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v${{ needs.version.outputs.version }}
-          name: v${{ needs.version.outputs.version }}
+          tag_name: ${{ needs.version.outputs.tag }}
+          name: ${{ needs.version.outputs.title }}
+          prerelease: ${{ needs.version.outputs.prerelease }}
           files: |
             artifacts/*.bin
             artifacts/*.exe

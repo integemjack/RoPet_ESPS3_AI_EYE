@@ -116,7 +116,8 @@ def load_bundled_firmwares():
     """扫描内置固件, 返回 ({目标显示名: asset}, 版本号)。
 
     asset 结构与在线 Release 的资产保持一致, 额外带 "path" 字段表示本地文件,
-    这样烧录流程无需区分来源。文件名形如 v1.8.5_zhengchen_eye.bin。
+    这样烧录流程无需区分来源。文件名形如 v1.8.5_zhengchen_eye.bin;
+    分支预发布版本号里会带分支名, 形如 v1.8.18-feat-xxx_zhengchen_eye.bin。
     """
     base = _bundle_dir()
     found = {}
@@ -130,7 +131,11 @@ def load_bundled_firmwares():
                 continue
             path = os.path.join(d, fn)
             for name, t in TARGETS.items():
-                if t["match"] in fn and name not in found:
+                # 必须锚定在 "_<match>.bin" 后缀上, 不能用子串包含:
+                # 分支预发布的文件名里带分支 slug, 像 fix/c5-wifi-bridge 这种分支
+                # 会让 S3 固件 v..-fix-c5-wifi-bridge_zhengchen_eye.bin 同时命中
+                # 两个目标, 把 S3 固件误当成 C5 固件烧进去。
+                if fn.endswith("_" + t["match"] + ".bin") and name not in found:
                     found[name] = {
                         "name": fn,
                         "path": path,
