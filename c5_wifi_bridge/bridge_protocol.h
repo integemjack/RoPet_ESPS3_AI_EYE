@@ -118,6 +118,7 @@ typedef enum {
     BRIDGE_MOTION_JUMP        = 8,  /* 四肢同相蹦跳 */
     BRIDGE_MOTION_DANCE       = 9,  /* 四肢交替 + 尾巴快摇 */
     BRIDGE_MOTION_NOD_BODY    = 10, /* 前肢下压再起, 像点头 */
+    BRIDGE_MOTION_TURN        = 11, /* 原地转向 (direction: -1=左转 1=右转) */
     BRIDGE_MOTION_MAX
 } bridge_motion_action_t;
 

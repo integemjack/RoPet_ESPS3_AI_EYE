@@ -3,9 +3,12 @@
  */
 #include "eye_motion.h"
 
+#include <cctype>
 #include <cstring>
+#include <string>
 
 #include <esp_log.h>
+#include <esp_timer.h>
 
 #include "device_state.h"
 #include "mcp_server.h"
@@ -173,6 +176,269 @@ void EyeMotion::OnTouch(bool left) {
     Play(req);
 }
 
+// ---------------- 本地意图 (不经 LLM) ----------------
+//
+// 为什么要有这一层: 动作原本只有两条路进来 —— 服务端 LLM 调 MCP 工具, 或者
+// LLM 给的情绪标签。两条都要等服务端一个来回, 而且服务端不支持 MCP 时"往前走"
+// 根本不会动。这里在 STT 文本落地的那一刻直接认关键词, 本地就把帧发出去:
+//   * 不依赖服务端是否支持工具调用
+//   * 比 LLM 回来快 1-2 秒, 说完就动
+// LLM 那条路照常保留 —— 它能理解"绕着桌子转一圈"这种关键词表覆盖不了的说法。
+// 两条路撞在一起时靠 RecentlyPlayedLocally() 去重。
+
+namespace {
+
+// 哨兵: 表示"停止"而不是某个具体动作
+constexpr bridge_motion_action_t kIntentStop = BRIDGE_MOTION_MAX;
+
+struct IntentRule {
+    const char*            keyword;
+    bridge_motion_action_t action;
+    int                    repeat;
+    int                    period_ms;
+    int                    amount;
+};
+
+// 顺序即优先级, 第一条命中的赢。所以:
+//   * "停" 类放最前 —— 任何时候都要能叫停
+//   * "跳舞" 必须排在 "跳" 前面, 否则 "跳个舞" 会被当成蹦跳
+//   * 泛化的单字词 ("走"/"尾巴") 垫底做兜底
+const IntentRule kIntentTable[] = {
+    // —— 停止 ——
+    {"停下",     kIntentStop,              0, 0,    0},
+    {"停止",     kIntentStop,              0, 0,    0},
+    {"别动",     kIntentStop,              0, 0,    0},
+    {"不要动",   kIntentStop,              0, 0,    0},
+    {"停一下",   kIntentStop,              0, 0,    0},
+
+    // —— 站起/归位 ——
+    {"站起来",   BRIDGE_MOTION_HOME,       1, 500,  0},
+    {"起立",     BRIDGE_MOTION_HOME,       1, 500,  0},
+    {"站好",     BRIDGE_MOTION_HOME,       1, 500,  0},
+    {"站直",     BRIDGE_MOTION_HOME,       1, 500,  0},
+
+    // —— 跳舞 (必须在"跳"之前) ——
+    {"跳舞",     BRIDGE_MOTION_DANCE,      3, 700,  75},
+    {"跳个舞",   BRIDGE_MOTION_DANCE,      3, 700,  75},
+    {"来段舞",   BRIDGE_MOTION_DANCE,      3, 700,  75},
+    {"舞蹈",     BRIDGE_MOTION_DANCE,      3, 700,  75},
+    {"扭一扭",   BRIDGE_MOTION_DANCE,      3, 650,  70},
+
+    // —— 行走 (四肢) ——
+    {"往前走",   BRIDGE_MOTION_WALK,       4, 700,  70},
+    {"向前走",   BRIDGE_MOTION_WALK,       4, 700,  70},
+    {"往后退",   BRIDGE_MOTION_WALK,       3, 700,  70},
+    {"向后退",   BRIDGE_MOTION_WALK,       3, 700,  70},
+    {"前进",     BRIDGE_MOTION_WALK,       4, 700,  70},
+    {"后退",     BRIDGE_MOTION_WALK,       3, 700,  70},
+    {"倒退",     BRIDGE_MOTION_WALK,       3, 700,  70},
+    {"退后",     BRIDGE_MOTION_WALK,       3, 700,  70},
+    {"走两步",   BRIDGE_MOTION_WALK,       2, 700,  70},
+    {"走一走",   BRIDGE_MOTION_WALK,       4, 700,  70},
+    {"走起来",   BRIDGE_MOTION_WALK,       4, 700,  70},
+    {"走路",     BRIDGE_MOTION_WALK,       4, 700,  70},
+    {"过来",     BRIDGE_MOTION_WALK,       4, 650,  75},
+
+    // —— 转向 (方向在下面按"左"字判定, 所以这里左右共用规则) ——
+    {"向左转",   BRIDGE_MOTION_TURN,       3, 700,  75},
+    {"往左转",   BRIDGE_MOTION_TURN,       3, 700,  75},
+    {"向右转",   BRIDGE_MOTION_TURN,       3, 700,  75},
+    {"往右转",   BRIDGE_MOTION_TURN,       3, 700,  75},
+    {"左转",     BRIDGE_MOTION_TURN,       3, 700,  75},
+    {"右转",     BRIDGE_MOTION_TURN,       3, 700,  75},
+    {"左拐",     BRIDGE_MOTION_TURN,       3, 700,  75},
+    {"右拐",     BRIDGE_MOTION_TURN,       3, 700,  75},
+    {"掉头",     BRIDGE_MOTION_TURN,       6, 700,  80},
+    {"调头",     BRIDGE_MOTION_TURN,       6, 700,  80},   // 同音异形, STT 多输出这个
+    // STT 容错: 实测中文 ASR 稳定把"左转/右转"听成"左板/右板"("转"→"板")。
+    // 这两个词在中文里不成词, 拿来当转向指令不会误伤正常说话。
+    {"向左板",   BRIDGE_MOTION_TURN,       3, 700,  75},
+    {"向右板",   BRIDGE_MOTION_TURN,       3, 700,  75},
+    {"左板",     BRIDGE_MOTION_TURN,       3, 700,  75},
+    {"右板",     BRIDGE_MOTION_TURN,       3, 700,  75},
+    {"转圈",     BRIDGE_MOTION_TURN,       6, 650,  80},
+    {"转一圈",   BRIDGE_MOTION_TURN,       6, 650,  80},
+    {"转个圈",   BRIDGE_MOTION_TURN,       6, 650,  80},
+    {"转身",     BRIDGE_MOTION_TURN,       4, 700,  80},
+
+    // —— 蹦跳 ——
+    {"跳一下",   BRIDGE_MOTION_JUMP,       2, 450,  80},
+    {"跳一跳",   BRIDGE_MOTION_JUMP,       2, 450,  80},
+    {"跳起来",   BRIDGE_MOTION_JUMP,       2, 450,  85},
+    {"原地跳",   BRIDGE_MOTION_JUMP,       3, 450,  80},
+    {"蹦",       BRIDGE_MOTION_JUMP,       2, 450,  80},
+
+    // —— 静态姿态 ——
+    {"坐下",     BRIDGE_MOTION_SIT,        1, 800,  80},
+    {"坐好",     BRIDGE_MOTION_SIT,        1, 800,  80},
+    {"请坐",     BRIDGE_MOTION_SIT,        1, 800,  80},
+    {"趴下",     BRIDGE_MOTION_LIE,        1, 1200, 80},
+    {"躺下",     BRIDGE_MOTION_LIE,        1, 1200, 80},
+    {"趴着",     BRIDGE_MOTION_LIE,        1, 1200, 80},
+    {"睡觉",     BRIDGE_MOTION_LIE,        1, 1500, 85},
+    {"休息",     BRIDGE_MOTION_LIE,        1, 1500, 80},
+
+    // —— 上肢 / 招呼 ——
+    {"挥挥手",   BRIDGE_MOTION_WAVE,       3, 450,  75},
+    {"挥手",     BRIDGE_MOTION_WAVE,       3, 450,  75},
+    {"招手",     BRIDGE_MOTION_WAVE,       3, 450,  75},
+    {"打招呼",   BRIDGE_MOTION_WAVE,       3, 450,  75},
+    {"握手",     BRIDGE_MOTION_WAVE,       2, 500,  70},
+    {"抬手",     BRIDGE_MOTION_WAVE,       2, 500,  70},
+    {"举手",     BRIDGE_MOTION_WAVE,       2, 500,  70},
+
+    // —— 其它 ——
+    {"伸懒腰",   BRIDGE_MOTION_STRETCH,    1, 1600, 80},
+    {"懒腰",     BRIDGE_MOTION_STRETCH,    1, 1600, 80},
+    {"伸展",     BRIDGE_MOTION_STRETCH,    1, 1600, 70},
+    {"点点头",   BRIDGE_MOTION_NOD_BODY,   2, 700,  70},
+    {"点头",     BRIDGE_MOTION_NOD_BODY,   2, 700,  70},
+    {"点个头",   BRIDGE_MOTION_NOD_BODY,   2, 700,  70},
+    {"发抖",     BRIDGE_MOTION_SHIVER,     5, 280,  85},
+    {"抖一抖",   BRIDGE_MOTION_SHIVER,     5, 280,  85},
+    {"哆嗦",     BRIDGE_MOTION_SHIVER,     5, 280,  85},
+    {"摇尾巴",   BRIDGE_MOTION_WAG_TAIL,   4, 320,  90},
+    {"甩尾巴",   BRIDGE_MOTION_WAG_TAIL,   4, 320,  90},
+    {"晃尾巴",   BRIDGE_MOTION_WAG_TAIL,   4, 320,  90},
+
+    // —— 兜底的泛化单词, 一定放最后 ——
+    {"走",       BRIDGE_MOTION_WALK,       3, 700,  70},
+    {"尾巴",     BRIDGE_MOTION_WAG_TAIL,   3, 350,  85},
+};
+
+// 关键词前面 3 个汉字内出现否定词就不触发 —— "别走了"/"不用坐下" 不该动。
+// 停止类规则本身就是否定式, 不走这个检查。
+bool NegatedBefore(const std::string& t, size_t pos) {
+    const size_t kLookBack = 9;   // 3 个汉字 (UTF-8)
+    size_t start = pos > kLookBack ? pos - kLookBack : 0;
+    std::string prefix = t.substr(start, pos - start);
+    return prefix.find("不") != std::string::npos ||
+           prefix.find("别") != std::string::npos ||
+           prefix.find("没") != std::string::npos ||
+           prefix.find("无需") != std::string::npos;
+}
+
+// "走两步" / "跳3下" -> 次数。没说次数返回 0 (用规则表的默认值)。
+int ParseCount(const std::string& t) {
+    static const struct { const char* w; int v; } kDigits[] = {
+        {"两", 2}, {"一", 1}, {"二", 2}, {"三", 3}, {"四", 4}, {"五", 5},
+        {"六", 6}, {"七", 7}, {"八", 8}, {"九", 9}, {"十", 10},
+    };
+    static const char* kUnits[] = {"下", "次", "步", "圈", "遍", "回"};
+
+    for (const char* unit : kUnits) {
+        size_t p = t.find(unit);
+        if (p == std::string::npos || p == 0) continue;
+
+        for (const auto& d : kDigits) {
+            size_t dl = strlen(d.w);
+            if (p >= dl && t.compare(p - dl, dl, d.w) == 0) return d.v;
+        }
+        // 阿拉伯数字, 最多两位 ("跳12下")
+        if (isdigit(static_cast<unsigned char>(t[p - 1]))) {
+            int v = t[p - 1] - '0';
+            if (p >= 2 && isdigit(static_cast<unsigned char>(t[p - 2]))) {
+                v += (t[p - 2] - '0') * 10;
+            }
+            return v;
+        }
+    }
+    return 0;
+}
+
+int Clamp(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
+
+}  // namespace
+
+bool EyeMotion::OnUserText(const char* text) {
+    if (text == nullptr || *text == '\0') return false;
+    std::string t(text);
+
+    for (const auto& rule : kIntentTable) {
+        size_t pos = t.find(rule.keyword);
+        if (pos == std::string::npos) continue;
+
+        if (rule.action == kIntentStop) {
+            ESP_LOGI(TAG, "local intent '%s' -> stop", rule.keyword);
+            Stop();
+            return true;
+        }
+        if (NegatedBefore(t, pos)) continue;   // "别走了" —— 接着找下一条
+
+        MotionRequest req;
+        req.action    = rule.action;
+        req.repeat    = rule.repeat;
+        req.period_ms = rule.period_ms;
+        req.amount    = rule.amount;
+        // 用户直接下的命令, 和 MCP 一样抢占当前动作。
+        req.preempt   = true;
+        // 坐下/趴下是静态姿态, 走完不能弹回中位。
+        req.home_end  = (rule.action != BRIDGE_MOTION_SIT &&
+                         rule.action != BRIDGE_MOTION_LIE);
+
+        // 方向: 走路认前后, 挥手认左右。
+        if (rule.action == BRIDGE_MOTION_WALK) {
+            bool backward = t.find("后") != std::string::npos ||
+                            t.find("退") != std::string::npos ||
+                            t.find("倒") != std::string::npos;
+            req.direction = backward ? -1 : 1;
+        } else if (rule.action == BRIDGE_MOTION_WAVE ||
+                   rule.action == BRIDGE_MOTION_TURN) {
+            // 没提左右时默认右 ("转个圈" 这种)。"左转右转" 会认先出现的那个。
+            req.direction = (t.find("左") != std::string::npos) ? -1 : 1;
+        }
+
+        // "走两步" / "跳三下"
+        int count = ParseCount(t);
+        if (count > 0) req.repeat = count;
+
+        // 程度副词。HOME 没有幅度/次数可调, 跳过。
+        if (rule.action != BRIDGE_MOTION_HOME) {
+            if (t.find("快") != std::string::npos)  req.period_ms = req.period_ms * 3 / 5;
+            if (t.find("慢") != std::string::npos)  req.period_ms = req.period_ms * 8 / 5;
+            if (t.find("用力") != std::string::npos || t.find("使劲") != std::string::npos ||
+                t.find("大一点") != std::string::npos || t.find("大点") != std::string::npos) {
+                req.amount = 100;
+            }
+            if (t.find("轻") != std::string::npos || t.find("小一点") != std::string::npos ||
+                t.find("小点") != std::string::npos) {
+                req.amount = 40;
+            }
+        }
+
+        req.repeat    = Clamp(req.repeat, 1, 50);
+        req.period_ms = Clamp(req.period_ms, 200, 5000);
+        req.amount    = Clamp(req.amount, 0, 100);
+
+        ESP_LOGI(TAG, "local intent '%s' -> action %d (repeat=%d period=%d amount=%d dir=%d)",
+                 rule.keyword, (int)req.action, req.repeat, req.period_ms,
+                 req.amount, req.direction);
+
+        if (!Play(req)) {
+            ESP_LOGW(TAG, "local intent matched but motion link unavailable");
+            return false;
+        }
+        MarkPlayedLocally(rule.action);
+        return true;
+    }
+    return false;
+}
+
+void EyeMotion::MarkPlayedLocally(bridge_motion_action_t action) {
+    std::lock_guard<std::mutex> lk(mutex_);
+    local_action_    = action;
+    local_action_us_ = esp_timer_get_time();
+}
+
+bool EyeMotion::RecentlyPlayedLocally(bridge_motion_action_t action) {
+    // 3 秒: 服务端 LLM 的工具回调通常在 1-2 秒内到, 再久就该当成新的一次命令。
+    const int64_t kWindowUs = 3 * 1000 * 1000;
+    std::lock_guard<std::mutex> lk(mutex_);
+    if (local_action_ != action) return false;
+    int64_t dt = esp_timer_get_time() - local_action_us_;
+    return dt >= 0 && dt < kWindowUs;
+}
+
 // ---------------- MCP 工具 ----------------
 
 void EyeMotion::RegisterMcpTools() {
@@ -181,6 +447,10 @@ void EyeMotion::RegisterMcpTools() {
     // 通用的"播一个动作"闭包工厂, 省得每个工具都抄一遍参数解包。
     auto make_handler = [this](bridge_motion_action_t action, bool hold) {
         return [this, action, hold](const PropertyList& properties) -> ReturnValue {
+            // 本地关键词刚播过同一个动作 —— 这是同一句话的回声 (用户说"坐下",
+            // 本地已经坐了, 服务端 LLM 又调了一次工具), 跳过免得动两遍。
+            if (RecentlyPlayedLocally(action)) return true;
+
             MotionRequest req;
             req.action    = action;
             req.repeat    = properties["repeat"].value<int>();
@@ -242,8 +512,30 @@ void EyeMotion::RegisterMcpTools() {
                     Property("direction", kPropertyTypeInteger, 1, -1, 1),
                 }),
                 [this](const PropertyList& properties) -> ReturnValue {
+                    if (RecentlyPlayedLocally(BRIDGE_MOTION_WALK)) return true;
                     MotionRequest req;
                     req.action    = BRIDGE_MOTION_WALK;
+                    req.repeat    = properties["repeat"].value<int>();
+                    req.period_ms = properties["speed"].value<int>();
+                    req.amount    = properties["amount"].value<int>();
+                    req.direction = properties["direction"].value<int>();
+                    req.preempt   = true;
+                    if (!Play(req)) return std::string("舵机链路不可用");
+                    return true;
+                });
+
+    mcp.AddTool("self.pet.turn",
+                std::string("原地转向。direction: -1=左转, 1=右转。") + kParamDoc,
+                PropertyList({
+                    Property("repeat", kPropertyTypeInteger, 3, 1, 50),
+                    Property("speed", kPropertyTypeInteger, 700, 200, 5000),
+                    Property("amount", kPropertyTypeInteger, 75, 0, 100),
+                    Property("direction", kPropertyTypeInteger, 1, -1, 1),
+                }),
+                [this](const PropertyList& properties) -> ReturnValue {
+                    if (RecentlyPlayedLocally(BRIDGE_MOTION_TURN)) return true;
+                    MotionRequest req;
+                    req.action    = BRIDGE_MOTION_TURN;
                     req.repeat    = properties["repeat"].value<int>();
                     req.period_ms = properties["speed"].value<int>();
                     req.amount    = properties["amount"].value<int>();
@@ -262,6 +554,7 @@ void EyeMotion::RegisterMcpTools() {
                     Property("direction", kPropertyTypeInteger, 1, -1, 1),
                 }),
                 [this](const PropertyList& properties) -> ReturnValue {
+                    if (RecentlyPlayedLocally(BRIDGE_MOTION_WAVE)) return true;
                     MotionRequest req;
                     req.action    = BRIDGE_MOTION_WAVE;
                     req.repeat    = properties["repeat"].value<int>();

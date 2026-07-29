@@ -8,6 +8,8 @@
 #include "assets/lang_config.h"
 #include "font_awesome_symbols.h"
 
+#include <cstring>
+
 #include <esp_lcd_panel_vendor.h>
 #include <wifi_station.h>
 #include <esp_log.h>
@@ -67,10 +69,10 @@ static const gc9a01_lcd_init_cmd_t gc9107_lcd_init_cmds[] = {
 LV_FONT_DECLARE(font_puhui_16_4);
 LV_FONT_DECLARE(font_awesome_16_4);
 
-// 在显示层拦一道情绪, 顺手驱动四肢/尾巴。
-// 走子类而不是改 application.cc: 情绪派发在核心代码里 (application.cc 的
-// "llm" 分支), 那是上游小智的文件, 改了以后每次同步上游都要处理冲突。
-// SetEmotion 是虚函数, 覆写它零侵入。
+// 在显示层拦两道消息, 顺手驱动四肢/尾巴。
+// 走子类而不是改 application.cc: 情绪和 STT 的派发都在核心代码里
+// (application.cc 的 "llm" / "stt" 分支), 那是上游小智的文件, 改了以后每次
+// 同步上游都要处理冲突。这两个都是虚函数, 覆写它们零侵入。
 class EyeLcdDisplay : public SpiLcdDisplay {
 public:
     using SpiLcdDisplay::SpiLcdDisplay;
@@ -78,6 +80,15 @@ public:
     void SetEmotion(const char* emotion) override {
         SpiLcdDisplay::SetEmotion(emotion);
         EyeMotion::GetInstance().OnEmotion(emotion);
+    }
+
+    // STT 结果落地就认关键词, 不等服务端 LLM 决定调不调工具。
+    // "往前走"这类明确的动作指令因此能立刻执行, 服务端没配 MCP 也照样动。
+    void SetChatMessage(const char* role, const char* content) override {
+        SpiLcdDisplay::SetChatMessage(role, content);
+        if (role != nullptr && strcmp(role, "user") == 0) {
+            EyeMotion::GetInstance().OnUserText(content);
+        }
     }
 };
 

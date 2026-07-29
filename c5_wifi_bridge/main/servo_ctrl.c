@@ -132,6 +132,14 @@ static const motion_pattern_t s_patterns[BRIDGE_MOTION_MAX] = {
     [BRIDGE_MOTION_NOD_BODY] = {          /* 前肢下压再起, 像点头 */
         {55, 55, 0, 0, 30}, {0, 0, 0, 0, 180}, {-20, -20, 0, 0, 0},
     },
+    /* 原地转向。每条腿只有一个前后摆的自由度 (没有髋外展), 所以转向只能靠
+     * 左右差速: 左侧两腿与右侧两腿反相划动, 一侧往前推、另一侧往后推,
+     * 合成一个偏航力矩。相位与 WALK 的对角步态不同 —— 这里是"同侧同相"。 */
+    [BRIDGE_MOTION_TURN] = {
+        {70, 70, 70, 70, 40},
+        {0, 180, 0, 180, 0},              /* 左侧 FL/RL 同相, 右侧 FR/RR 反相 */
+        {0, 0, 0, 0, 0},
+    },
 };
 
 /* ---------------- 运行时状态 ---------------- */
@@ -257,6 +265,17 @@ static void build_pattern(uint8_t action, int8_t direction, motion_pattern_t *ou
                 out->phase_deg[i] = (int16_t)((out->phase_deg[i] + 180) % 360);
             }
         }
+        break;
+
+    case BRIDGE_MOTION_TURN:
+        /* direction < 0 = 左转: 整体相位翻转, 两侧的推进方向对调, 偏航反向 */
+        if (direction < 0) {
+            for (int i = 0; i < BRIDGE_SERVO_COUNT; i++) {
+                out->phase_deg[i] = (int16_t)((out->phase_deg[i] + 180) % 360);
+            }
+        }
+        /* 尾巴静态甩向转向那一侧 —— 真狗转弯就是这样, 光看腿不容易看出在转 */
+        out->offset_pct[BRIDGE_SERVO_TAIL] = (direction < 0) ? -35 : 35;
         break;
     default:
         break;
