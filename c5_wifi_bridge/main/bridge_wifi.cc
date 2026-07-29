@@ -29,6 +29,7 @@
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
 #include "esp_wifi.h"
+#include "esp_mac.h"      /* MACSTR / MAC2STR */
 #include "esp_event.h"
 #include "esp_netif.h"
 #include "esp_log.h"
@@ -43,11 +44,26 @@ static const char *TAG = "bridge_wifi";
 /* 处于"等待 S3 配网"状态: 已初始化射频但没有可用凭据, 只响应扫描/验证请求。 */
 static bool s_provisioning = false;
 
-#define PROV_CONNECTED_BIT BIT0
-#define PROV_FAILED_BIT    BIT1
+#define PROV_CONNECTED_BIT  BIT0   /* 拿到 IP */
+#define PROV_FAILED_BIT     BIT1
+#define PROV_ASSOCIATED_BIT BIT2   /* 关联 + 4 次握手都过了, 只差 DHCP */
 static EventGroupHandle_t s_prov_events = nullptr;
 static volatile uint8_t s_prov_disconnect_reason = 0;
 static volatile bool s_prov_connecting = false;
+
+/* 配网扫描的结果缓存: 每个 SSID 保留信号最强的那个 5G BSS。
+ *
+ * 验证凭据时直接锁定这里的 bssid + channel, 省掉 esp_wifi_connect() 内部那次
+ * 全信道扫描 —— 在 C5 上它要扫 2.4G 14 个 + 5G 28 个信道, 实测 12s 以上,
+ * 会把验证窗口吃光, 表现为"关联明明成功了却报连接失败"。 */
+struct ProvBss {
+    std::string ssid;
+    uint8_t     bssid[6];
+    uint8_t     channel;
+    int8_t      rssi;
+    uint8_t     authmode;
+};
+static std::vector<ProvBss> s_scan_cache;
 
 /* 回读一次频段模式, 确认 2.4G + 5G 已生效 (纯诊断用, 不改变行为)。 */
 static void bridge_wifi_log_band_mode(void)
@@ -83,9 +99,17 @@ extern "C" void bridge_wifi_init(void)
 static void prov_wifi_event_handler(void* arg, esp_event_base_t base,
                                     int32_t id, void* data)
 {
+    if (id == WIFI_EVENT_STA_CONNECTED) {
+        /* 关联 + 4 次握手都过了。单独标出来是为了把"密码错"和"连上了但
+         * DHCP 不给 IP"分开 —— 后者不该报成密码错误让用户白改密码。 */
+        xEventGroupSetBits(s_prov_events, PROV_ASSOCIATED_BIT);
+        return;
+    }
+
     if (id == WIFI_EVENT_STA_DISCONNECTED) {
         auto* ev = static_cast<wifi_event_sta_disconnected_t*>(data);
         s_prov_disconnect_reason = ev->reason;
+        xEventGroupClearBits(s_prov_events, PROV_ASSOCIATED_BIT);
 
         if (!s_prov_connecting) {
             return;   /* 验证结束后我们自己断开的, 不要触发重连 */
@@ -199,14 +223,13 @@ extern "C" void bridge_wifi_announce_provision(void)
     bridge_send_frame(BRIDGE_EVT_NEED_PROVISION, BRIDGE_NO_LINK, NULL, 0);
 }
 
-/* 扫描 5G 频段并把结果回传 S3。
+/* 扫描 5G 频段, 结果写进 s_scan_cache (同 SSID 只留最强的那个 BSS, 按 RSSI 降序)。
  * 只扫 5G: 本产品固定用 5G, 而且 S3 的 2.4G 射频自己就能看见 2.4G,
- * 混在一起只会让用户误选到连不上的 2.4G 同名 SSID。 */
-extern "C" void bridge_wifi_scan_and_report(void)
+ * 混在一起只会让用户误选到连不上的 2.4G 同名 SSID。
+ * 返回 true 表示扫描本身成功 (扫到 0 个 AP 也算成功)。 */
+static bool prov_scan_5g(void)
 {
-    if (!s_provisioning) {
-        ESP_LOGW(TAG, "scan requested but not in provisioning mode");
-    }
+    s_scan_cache.clear();
 
     wifi_scan_config_t scan_config = {};
 #ifdef CONFIG_SOC_WIFI_SUPPORT_5G
@@ -225,18 +248,13 @@ extern "C" void bridge_wifi_scan_and_report(void)
     esp_err_t err = esp_wifi_scan_start(&scan_config, true);   /* 阻塞扫描 */
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "scan failed: %s", esp_err_to_name(err));
-        uint8_t zero = 0;
-        bridge_send_frame(BRIDGE_EVT_WIFI_SCAN_RESULT, BRIDGE_NO_LINK, &zero, 1);
-        return;
+        return false;
     }
 
     uint16_t ap_num = 0;
     esp_wifi_scan_get_ap_num(&ap_num);
-    if (ap_num == 0) {
-        uint8_t zero = 0;
-        bridge_send_frame(BRIDGE_EVT_WIFI_SCAN_RESULT, BRIDGE_NO_LINK, &zero, 1);
-        return;
-    }
+    if (ap_num == 0) return true;
+
     std::vector<wifi_ap_record_t> records(ap_num);
     esp_wifi_scan_get_ap_records(&ap_num, records.data());
     records.resize(ap_num);
@@ -246,23 +264,69 @@ extern "C" void bridge_wifi_scan_and_report(void)
                   return a.rssi > b.rssi;
               });
 
-    /* 同 SSID 只保留信号最强的那个 BSS, 免得配网页列出一堆重复项 */
-    std::vector<uint8_t> payload;
-    payload.push_back(0);   /* count 占位 */
-    uint8_t count = 0;
-    std::vector<std::string> seen;
+    /* 同 SSID 只保留信号最强的那个 BSS: 配网页不必列出一堆重复项,
+     * 验证时也直接用这一条锁定信道。 */
     for (const auto& r : records) {
         std::string ssid(reinterpret_cast<const char*>(r.ssid));
         if (ssid.empty()) continue;
-        if (std::find(seen.begin(), seen.end(), ssid) != seen.end()) continue;
+        auto same = [&](const ProvBss& b) { return b.ssid == ssid; };
+        if (std::find_if(s_scan_cache.begin(), s_scan_cache.end(), same)
+                != s_scan_cache.end()) {
+            continue;
+        }
+        ProvBss bss;
+        bss.ssid = ssid;
+        memcpy(bss.bssid, r.bssid, sizeof(bss.bssid));
+        bss.channel  = r.primary;
+        bss.rssi     = r.rssi;
+        bss.authmode = static_cast<uint8_t>(r.authmode);
+        s_scan_cache.push_back(bss);
+    }
+    return true;
+}
+
+/* 从缓存里取出某个 SSID 的 BSS。按值拷出去 —— 调用方拿到后可能会清缓存。 */
+static bool prov_lookup(const char* ssid, ProvBss* out)
+{
+    for (const auto& b : s_scan_cache) {
+        if (b.ssid == ssid) {
+            *out = b;
+            return true;
+        }
+    }
+    return false;
+}
+
+static void prov_forget(const char* ssid)
+{
+    s_scan_cache.erase(std::remove_if(s_scan_cache.begin(), s_scan_cache.end(),
+                                      [&](const ProvBss& b) { return b.ssid == ssid; }),
+                       s_scan_cache.end());
+}
+
+/* 扫描 5G 频段并把结果回传 S3。 */
+extern "C" void bridge_wifi_scan_and_report(void)
+{
+    if (!s_provisioning) {
+        ESP_LOGW(TAG, "scan requested but not in provisioning mode");
+    }
+
+    if (!prov_scan_5g()) {
+        uint8_t zero = 0;
+        bridge_send_frame(BRIDGE_EVT_WIFI_SCAN_RESULT, BRIDGE_NO_LINK, &zero, 1);
+        return;
+    }
+
+    std::vector<uint8_t> payload;
+    payload.push_back(0);   /* count 占位 */
+    uint8_t count = 0;
+    for (const auto& b : s_scan_cache) {
         /* 单帧上限 4096, 每条最多 3 + 32 字节, 留足余量后封顶 40 条 */
         if (count >= 40) break;
-        seen.push_back(ssid);
-
-        payload.push_back(static_cast<uint8_t>(r.rssi));
-        payload.push_back(static_cast<uint8_t>(r.authmode));
-        payload.push_back(static_cast<uint8_t>(ssid.size()));
-        payload.insert(payload.end(), ssid.begin(), ssid.end());
+        payload.push_back(static_cast<uint8_t>(b.rssi));
+        payload.push_back(b.authmode);
+        payload.push_back(static_cast<uint8_t>(b.ssid.size()));
+        payload.insert(payload.end(), b.ssid.begin(), b.ssid.end());
         count++;
     }
     payload[0] = count;
@@ -304,7 +368,25 @@ extern "C" void bridge_wifi_try_config(const char* ssid, const char* password)
 
     ESP_LOGI(TAG, "verifying credentials for %s", ssid);
     esp_wifi_scan_stop();
-    xEventGroupClearBits(s_prov_events, PROV_CONNECTED_BIT | PROV_FAILED_BIT);
+
+    /* 先确定要连哪个 BSS。缓存来自配网页那次扫描, 通常直接命中;
+     * 没命中就现扫一次 5G (约 4s) —— 仍然远比让 esp_wifi_connect()
+     * 自己去做 2.4G + 5G 全信道扫描 (12s+) 便宜。 */
+    ProvBss bss;
+    if (!prov_lookup(ssid, &bss)) {
+        ESP_LOGI(TAG, "%s not in scan cache, rescanning 5G", ssid);
+        prov_scan_5g();
+    }
+    if (!prov_lookup(ssid, &bss)) {
+        ESP_LOGW(TAG, "verify failed for %s (no 5G BSS found)", ssid);
+        report_config_result(false, "找不到该 WiFi, 请确认名称和信号");
+        return;
+    }
+    ESP_LOGI(TAG, "target BSS " MACSTR " ch=%u rssi=%d",
+             MAC2STR(bss.bssid), bss.channel, bss.rssi);
+
+    xEventGroupClearBits(s_prov_events,
+                         PROV_CONNECTED_BIT | PROV_FAILED_BIT | PROV_ASSOCIATED_BIT);
     s_prov_disconnect_reason = 0;
 
     wifi_config_t wifi_config = {};
@@ -312,9 +394,14 @@ extern "C" void bridge_wifi_try_config(const char* ssid, const char* password)
             sizeof(wifi_config.sta.ssid) - 1);
     strncpy(reinterpret_cast<char*>(wifi_config.sta.password), password ? password : "",
             sizeof(wifi_config.sta.password) - 1);
-    wifi_config.sta.scan_method = WIFI_ALL_CHANNEL_SCAN;
-    /* 双频同名时驱动要先试完 2.4G 的 BSS 才会切到 5G, 重试次数太少会提前放弃 */
-    wifi_config.sta.failure_retry_cnt = 3;
+    /* 锁死到扫描时看见的那个 5G BSS: FAST_SCAN 只在指定信道上探一次,
+     * 既不会跑去试同名的 2.4G BSS (每次 auth 超时约 1s), 也不用等全信道扫完。
+     * failure_retry_cnt 这里不设: 它只对 ALL_CHANNEL_SCAN 生效, 而且会把断连
+     * 事件吞掉 —— 上一版 reason 永远是 0 就是它干的, 错误文案跟着一起失真。 */
+    wifi_config.sta.scan_method = WIFI_FAST_SCAN;
+    wifi_config.sta.bssid_set   = true;
+    memcpy(wifi_config.sta.bssid, bss.bssid, sizeof(wifi_config.sta.bssid));
+    wifi_config.sta.channel     = bss.channel;
     wifi_config.sta.sort_method = WIFI_CONNECT_AP_BY_SIGNAL;
 
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
@@ -327,10 +414,19 @@ extern "C" void bridge_wifi_try_config(const char* ssid, const char* password)
         return;
     }
 
-    /* 等 15s: 双频同名 SSID 的换频段过程叠加重试后可能接近 10s */
+    /* 分两段等, 别把关联和 DHCP 挤在同一个窗口里。
+     * 上一版就是挤在一个 15s 里: 驱动的全信道扫描吃掉 12s、同名 2.4G BSS 的
+     * auth 超时再吃掉 1s, 轮到 DHCP 只剩 1s, 于是关联成功也被判成失败。 */
     EventBits_t bits = xEventGroupWaitBits(s_prov_events,
-                                           PROV_CONNECTED_BIT | PROV_FAILED_BIT,
-                                           pdTRUE, pdFALSE, pdMS_TO_TICKS(15000));
+                                           PROV_ASSOCIATED_BIT | PROV_FAILED_BIT,
+                                           pdFALSE, pdFALSE, pdMS_TO_TICKS(12000));
+    bool associated = (bits & PROV_ASSOCIATED_BIT) != 0;
+    if (associated) {
+        /* 关联上了才给 DHCP 单独计时。弱信号 (RSSI < -80) 下 DHCP 要重传几轮。 */
+        bits = xEventGroupWaitBits(s_prov_events,
+                                   PROV_CONNECTED_BIT | PROV_FAILED_BIT,
+                                   pdFALSE, pdFALSE, pdMS_TO_TICKS(12000));
+    }
     s_prov_connecting = false;
 
     if (bits & PROV_CONNECTED_BIT) {
@@ -346,25 +442,35 @@ extern "C" void bridge_wifi_try_config(const char* ssid, const char* password)
     uint8_t fail_reason = s_prov_disconnect_reason;
     esp_wifi_disconnect();
 
+    /* 刚才用的 BSS 信息可能已经过期 (132 之类的 DFS 信道被雷达赶走就会换台),
+     * 丢掉这条缓存, 用户点重试时会重新扫到新的信道。 */
+    prov_forget(ssid);
+
     const char* reason;
-    switch (fail_reason) {
-    case WIFI_REASON_NO_AP_FOUND:
-        reason = "找不到该 WiFi, 请确认名称和信号";
-        break;
-    case WIFI_REASON_AUTH_FAIL:
-    case WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT:
-    case WIFI_REASON_HANDSHAKE_TIMEOUT:
-        reason = "密码错误";
-        break;
-    case 0:
-        // 15s 内一次断连事件都没有: 通常是 AP 根本没响应
-        reason = "连接超时, 请确认 WiFi 可用";
-        break;
-    default:
-        reason = "连接失败, 请检查密码";
-        break;
+    if (associated) {
+        /* 关联和 4 次握手都过了 -> 密码是对的, 卡在 DHCP。别再喊"密码错误"。 */
+        reason = "已连上 WiFi 但拿不到 IP 地址, 请检查路由器";
+    } else {
+        switch (fail_reason) {
+        case WIFI_REASON_NO_AP_FOUND:
+            reason = "找不到该 WiFi, 请确认名称和信号";
+            break;
+        case WIFI_REASON_AUTH_FAIL:
+        case WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT:
+        case WIFI_REASON_HANDSHAKE_TIMEOUT:
+            reason = "密码错误";
+            break;
+        case 0:
+            /* 一次断连事件都没有: BSS 扫得到但关联不上, 基本都是信号太弱 */
+            reason = "连接超时, WiFi 信号可能太弱";
+            break;
+        default:
+            reason = "连接失败, 请检查密码";
+            break;
+        }
     }
-    ESP_LOGW(TAG, "verify failed for %s (reason=%d)", ssid, fail_reason);
+    ESP_LOGW(TAG, "verify failed for %s (associated=%d, reason=%d)",
+             ssid, associated ? 1 : 0, fail_reason);
     report_config_result(false, reason);
 }
 

@@ -96,9 +96,9 @@ void C5ProvisionPortal::StartWebServer() {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.max_uri_handlers = 24;
     config.lru_purge_enable = true;
-    // /submit 会同步等 C5 验证 (最长 25s), 别让 httpd 提前判超时
-    config.recv_wait_timeout = 30;
-    config.send_wait_timeout = 30;
+    // /submit 会同步等 C5 验证 (最长 40s), 别让 httpd 提前判超时
+    config.recv_wait_timeout = 45;
+    config.send_wait_timeout = 45;
     ESP_ERROR_CHECK(httpd_start(&server_, &config));
 
     // ---- 配网首页 (小智原版页面, 未改动) ----
@@ -204,7 +204,9 @@ void C5ProvisionPortal::StartWebServer() {
             cJSON_Delete(json);
 
             std::string error;
-            bool ok = self->bridge_.SendWifiConfig(ssid, pwd, error, 25000);
+            /* C5 那边的最坏路径: 缓存未命中先补扫 5G (~4s) + 关联 12s + DHCP 12s。
+             * 留到 40s 才不会在 C5 还在等 DHCP 时就先报"模块无响应"。 */
+            bool ok = self->bridge_.SendWifiConfig(ssid, pwd, error, 40000);
 
             httpd_resp_set_type(req, "application/json");
             httpd_resp_set_hdr(req, "Cache-Control", "no-store");

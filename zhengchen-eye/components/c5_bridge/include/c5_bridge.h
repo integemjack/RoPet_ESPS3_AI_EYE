@@ -107,7 +107,7 @@ public:
     // 因为热点在 S3 自己的射频上、不受 C5 换信道影响, 这里同步等待是安全的 ——
     // 手机与配网页的连接全程不会断。
     bool SendWifiConfig(const std::string& ssid, const std::string& password,
-                        std::string& error_out, int timeout_ms = 25000);
+                        std::string& error_out, int timeout_ms = 40000);
 
     // 探活: 发 PING 等 PONG, 返回 true 表示 C5 活着并响应。
     // 用于区分"C5 未就绪/接线问题"和"C5 活着但某帧丢失"。
