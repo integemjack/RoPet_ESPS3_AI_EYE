@@ -85,6 +85,12 @@ jobs:
             echo "${{ matrix.board_config }}=y"
             echo "CONFIG_USE_DEVICE_AEC=y"
             echo "CONFIG_USE_4G_WIFI=y"
+            # 屏幕类型必须显式指定: sdkconfig 不入库 (见 .gitignore), CI 只有
+            # sdkconfig.defaults + Kconfig 默认值, 而 DISPLAY_TYPE_ZHENGCHEN_EYE
+            # 的默认是 USE_LCD_240X240_GIF1 (GC9A01/240x240)。本机实际是
+            # GC9D01N/160x160, 拿 GC9A01 的初始化序列去打 GC9D01N 屏不会亮 ——
+            # 症状就是"本地烧的固件眼睛正常, CI 发布的固件眼睛不亮"。
+            echo "CONFIG_USE_LCD_160X160_GIF1=y"
           } >> sdkconfig
           idf.py -DBOARD_NAME="${{ matrix.board }}" build
           idf.py -DBOARD_NAME="${{ matrix.board }}" merge-bin
