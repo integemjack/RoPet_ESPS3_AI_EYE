@@ -232,6 +232,11 @@ static bool prov_scan_5g(void)
     s_scan_cache.clear();
 
     wifi_scan_config_t scan_config = {};
+    /* 被动扫描每信道停留 360ms(默认) -> 150ms。国家码 "01" 下 5G 只能被动扫,
+     * 28 个信道按默认值要 ~10s, 配网页拉 SSID 列表就得干等这么久。
+     * AP 的 beacon 间隔实测 102.4ms, 停留 150ms 足够收到一个。
+     * (与 wifi_station.cc 里 StartScan() 的取值保持一致) */
+    scan_config.scan_time.passive = 150;
 #ifdef CONFIG_SOC_WIFI_SUPPORT_5G
     scan_config.channel = 0;   /* 0 才会启用下面的 bitmap */
     scan_config.channel_bitmap.ghz_2_channels = 0;
@@ -259,8 +264,25 @@ static bool prov_scan_5g(void)
     esp_wifi_scan_get_ap_records(&ap_num, records.data());
     records.resize(ap_num);
 
+    /* 排序: 先 5GHz, 同频段内再按 RSSI 降序。
+     *
+     * 上面的 channel_bitmap 只是"尽量"限制到 5G, 实测挡不住 2.4G 的 BSS ——
+     * 扫描结果里照样有 ch6 的条目 (S3 自己的配网热点、同名双频路由器的 2.4G)。
+     * 而下面的去重是"同 SSID 只保留第一个", 只按 RSSI 排的话, 双频同名时
+     * 2.4G 往往更强 (穿透好), 缓存里就存成了 2.4G 的 BSS。
+     *
+     * 后果很直接: bridge_wifi_try_config 会把 STA 锁死到那个 2.4G BSS,
+     * 而实测这台路由器的 2.4G BSS 直接拒绝认证 (reason=202), 验证秒失败并
+     * 报"密码错误" —— 密码其实是对的。wifi_station.cc 的 HandleScanResult
+     * 早就为同一个坑做了 5G 优先排序, 这里保持一致。
+     * (2.4G 信道号 1~14, 5G 远大于 14) */
     std::sort(records.begin(), records.end(),
               [](const wifi_ap_record_t& a, const wifi_ap_record_t& b) {
+                  bool a_is_5g = a.primary > 14;
+                  bool b_is_5g = b.primary > 14;
+                  if (a_is_5g != b_is_5g) {
+                      return a_is_5g;
+                  }
                   return a.rssi > b.rssi;
               });
 
@@ -334,6 +356,22 @@ extern "C" void bridge_wifi_scan_and_report(void)
     ESP_LOGI(TAG, "scan done, report %d ssid(s) to S3", count);
     bridge_send_frame(BRIDGE_EVT_WIFI_SCAN_RESULT, BRIDGE_NO_LINK,
                       payload.data(), static_cast<uint16_t>(payload.size()));
+}
+
+/* 把验证通过的 BSS 写进 WifiStation 的快速重连记录 (NVS 命名空间 "wifi")。
+ * 键名必须和 wifi_station.cc 里的 StartFastConnect/SaveFastConnect 一致。 */
+static void prov_seed_fast_connect(const char* ssid, const uint8_t* bssid, uint8_t channel)
+{
+    nvs_handle_t nvs;
+    if (nvs_open("wifi", NVS_READWRITE, &nvs) != ESP_OK) {
+        return;
+    }
+    nvs_set_str(nvs, "last_ssid", ssid);
+    nvs_set_blob(nvs, "last_bssid", bssid, 6);
+    nvs_set_u8(nvs, "last_ch", channel);
+    nvs_commit(nvs);
+    nvs_close(nvs);
+    ESP_LOGI(TAG, "seeded fast-connect record: %s ch=%u", ssid, channel);
 }
 
 /* 回传验证结果。ok=0 时附带错误文案 (UTF-8, 直接显示在 S3 的配网页上)。 */
@@ -432,6 +470,11 @@ extern "C" void bridge_wifi_try_config(const char* ssid, const char* password)
     if (bits & PROV_CONNECTED_BIT) {
         ESP_LOGI(TAG, "credentials verified, saving %s", ssid);
         SsidManager::GetInstance().AddSsid(ssid, password ? password : "");
+        /* 顺手把刚验证通过的 BSS 种给 WifiStation 的快速重连记录 (NVS 键
+         * last_ssid/last_bssid/last_ch, 见 wifi_station.cc: StartFastConnect)。
+         * 否则配网成功后的第一次开机没有记录, 还要再全扫一遍 ~4s。
+         * 这里的 bssid/channel 刚刚才连通过, 是可信的。 */
+        prov_seed_fast_connect(ssid, bss.bssid, bss.channel);
         report_config_result(true, nullptr);
         /* 保持连接状态: S3 收到成功后会安排双方重启, 重启后正常走 WifiStation */
         return;

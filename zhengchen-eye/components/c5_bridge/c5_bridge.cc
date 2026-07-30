@@ -313,9 +313,12 @@ void C5Bridge::DispatchFrame(uint8_t type, uint8_t link_id, const uint8_t* paylo
 }
 
 bool C5Bridge::WaitForNetworkReady(int timeout_ms) {
-    // 先等 C5 就绪 (不清除标志位, 允许多次查询)
+    // 先等 C5 就绪 (不清除标志位, 允许多次查询)。
+    // 同 WaitForNetworkOrProvision: READY 只发一次且早于 S3 起 UART, 收不到时
+    // 别在这里干等满 10 秒 —— 已经联网的信号同样能证明 C5 活着。
     if (!c5_ready_) {
-        xEventGroupWaitBits(events_, EV_C5_READY, pdFALSE, pdFALSE, pdMS_TO_TICKS(10000));
+        xEventGroupWaitBits(events_, EV_C5_READY | EV_WIFI_CONNECTED,
+                            pdFALSE, pdFALSE, pdMS_TO_TICKS(10000));
     }
     // 再等 WiFi 连接 (C5 自主配网/连接)
     EventBits_t bits = xEventGroupWaitBits(events_, EV_WIFI_CONNECTED, pdFALSE, pdFALSE,
@@ -421,8 +424,19 @@ bool C5Bridge::ResetWifiCredentials(int timeout_ms) {
 }
 
 bool C5Bridge::WaitForNetworkOrProvision(int timeout_ms) {
+    // 这里以前只等 EV_C5_READY, 等不到就干烧满 10 秒。
+    //
+    // C5 的 EVT_READY 在它开机约 0.4s 就发出去了, 而 S3 这边要到 ~2.9s 才起
+    // UART 接收任务 (前面还有 LCD/LVGL/音频编解码器的初始化), 那一帧因此必然
+    // 丢掉 —— READY 只发一次, 不重发。实测 bridge 启动 2862ms + 10000ms 超时
+    // = 12862ms 才往下走, 而 C5 其实 3152ms 就拿到 IP 了, 白等近 10 秒, 表现为
+    // "C5 早连上了, S3 却迟迟不进 idle, 眼睛跟着晚亮 10 秒"。
+    //
+    // 改成三个信号任一到达就继续: WIFI_CONNECTED / NEED_PROVISION 本来就是我们
+    // 真正要等的结果, 它们到了就说明 C5 活着, 再等 READY 没有意义。
     if (!c5_ready_) {
-        xEventGroupWaitBits(events_, EV_C5_READY, pdFALSE, pdFALSE, pdMS_TO_TICKS(10000));
+        xEventGroupWaitBits(events_, EV_C5_READY | EV_WIFI_CONNECTED | EV_NEED_PROVISION,
+                            pdFALSE, pdFALSE, pdMS_TO_TICKS(10000));
     }
     // 两个结果任一到达就返回, 不必空等满超时:
     // C5 一开机就知道自己有没有凭据, 没有的话会立刻发 NEED_PROVISION。

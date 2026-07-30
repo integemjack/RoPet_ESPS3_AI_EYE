@@ -5,7 +5,8 @@
             "name": "zhengchen_eye",
             "sdkconfig_append": [
                 "CONFIG_USE_DEVICE_AEC=y",
-                "CONFIG_USE_4G_WIFI=y"
+                "CONFIG_USE_4G_WIFI=y",
+                "CONFIG_USE_LCD_160X160_GIF1=y"
             ]
         }
     ]

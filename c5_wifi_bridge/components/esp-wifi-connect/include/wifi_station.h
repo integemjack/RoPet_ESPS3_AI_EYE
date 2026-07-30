@@ -51,6 +51,8 @@ private:
     int8_t max_tx_power_;
     uint8_t remember_bssid_;
     int reconnect_count_ = 0;
+    // [本地修改] 正在走"直接定连上次的 BSS"这条快路 (见 wifi_station.cc)
+    bool fast_connect_active_ = false;
     std::function<void(const std::string& ssid)> on_connect_;
     std::function<void(const std::string& ssid)> on_connected_;
     std::function<void()> on_scan_begin_;
@@ -58,6 +60,10 @@ private:
 
     void HandleScanResult();
     void StartConnect();
+    // [本地修改] 开机快速重连: 成功后记住 BSS, 下次开机直接定连、跳过扫描
+    bool StartFastConnect();
+    void SaveFastConnect();
+    void EraseFastConnect();
     static void WifiEventHandler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data);
     static void IpEventHandler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data);
 };
