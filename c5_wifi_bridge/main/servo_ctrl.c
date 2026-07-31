@@ -19,6 +19,7 @@
 
 #include "driver/ledc.h"
 #include "esp_log.h"
+#include "esp_private/esp_gpio_reserve.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -185,12 +186,18 @@ static void servo_attach(void)
     s_attached = true;
 }
 
-/* 断 PWM, 输出拉低。舵机收不到脉冲就松力, 既省电又不会在极限位上堵着发热。 */
+/* 断 PWM, 输出拉低。舵机收不到脉冲就松力, 既省电又不会在极限位上堵着发热。
+ *
+ * ledc_stop 只停波形, 不会归还 ledc_channel_config 里 esp_gpio_reserve 占的
+ * 那一位。空闲 3s detach 之后再 attach, IDF 就以为这些脚被别人占了, 每次刷
+ * 5 行 "GPIO x is not usable, maybe conflict with others"。信号其实照样接上
+ * (ledc.c 在告警之后仍会 connect_out_signal), 但日志噪音会盖掉真正的问题。 */
 static void servo_detach(void)
 {
     if (!s_attached) return;
     for (int i = 0; i < BRIDGE_SERVO_COUNT; i++) {
         ledc_stop(LEDC_LOW_SPEED_MODE, chan_of(i), 0);
+        esp_gpio_revoke(BIT64(s_cfg[i].gpio));
     }
     s_attached = false;
 }

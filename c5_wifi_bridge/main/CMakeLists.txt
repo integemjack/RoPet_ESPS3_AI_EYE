@@ -10,6 +10,7 @@ idf_component_register(
         ".."             # 引用工程根下的 bridge_protocol.h (与 S3 端共享)
     REQUIRES
         driver
+        esp_hw_support   # esp_private/esp_gpio_reserve.h, servo_detach 归还引脚占用
         esp_timer
         esp_wifi
         esp_netif
