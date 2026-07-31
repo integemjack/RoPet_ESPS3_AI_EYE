@@ -268,11 +268,26 @@ const IntentRule kIntentTable[] = {
     {"来段舞",   BRIDGE_MOTION_DANCE,      3, 700,  75},
     {"舞蹈",     BRIDGE_MOTION_DANCE,      3, 700,  75},
     {"扭一扭",   BRIDGE_MOTION_DANCE,      3, 650,  70},
+    // "表演/才艺" 只说"表演"不说具体动作, 是最含糊的一类请求, LLM 实测命中率
+    // 只有一半左右 (其他中文指令都是 100%)。放进本地表就确定了。
+    {"表演",     BRIDGE_MOTION_DANCE,      3, 700,  75},
+    {"才艺",     BRIDGE_MOTION_DANCE,      3, 700,  75},
+    {"露一手",   BRIDGE_MOTION_DANCE,      3, 700,  75},
     {"dance",    BRIDGE_MOTION_DANCE,      3, 700,  75},
     {"dancing",  BRIDGE_MOTION_DANCE,      3, 700,  75},
     {"perform",  BRIDGE_MOTION_DANCE,      3, 700,  75},
     {"do a trick", BRIDGE_MOTION_DANCE,    3, 700,  75},
     {"show me a trick", BRIDGE_MOTION_DANCE, 3, 700, 75},
+    // ASR 容错: "dance for me" 实测会被听成 "helthing/sounds/thanks/something
+    // for me"。把服务端收到的原始 WAV 离线重跑, 结果和线上一字不差, 说明音频
+    // 里的信息本身就不够 —— "dance" 的词首 /d/ 太弱, 模型抓住词尾的 /ns/ 就猜
+    // 成了 sounds//θæŋks/ 这些同韵尾的词。
+    // 只收完整三词短语: 英语里没人会说 "thanks for me" / "sounds for me",
+    // 拿来当指令不会误伤; 单收裸 "thanks" 就会。
+    {"helthing", BRIDGE_MOTION_DANCE,      3, 700,  75},
+    {"sounds for me",    BRIDGE_MOTION_DANCE, 3, 700, 75},
+    {"thanks for me",    BRIDGE_MOTION_DANCE, 3, 700, 75},
+    {"something for me", BRIDGE_MOTION_DANCE, 3, 700, 75},
 
     // —— 行走 (四肢) ——
     {"往前走",   BRIDGE_MOTION_WALK,       4, 700,  70},
@@ -300,6 +315,15 @@ const IntentRule kIntentTable[] = {
     {"walk",         BRIDGE_MOTION_WALK,   4, 700,  70},
     // ASR 容错: 实测 "walk forward" 被听成 "welcome forward all that"。
     // 这类词组在正常对话里不成句, 拿来当指令不会误伤。
+    //
+    // 排查结论 (逐项排除): 干净 TTS 音频喂同一个 SenseVoiceSmall 是 5/6 正确,
+    // 排除模型; 服务端实收的 WAV 离线重跑与线上一字不差, 排除 ASR 调用和分段;
+    // 波形前有 400ms 静音, 排除切头和 VAD pre-roll; 音量放大 8 倍结果不变,
+    // 排除麦克风增益。剩下的就是说话音频本身携带的信息不够。
+    //
+    // 错法跨会话会变 (dance for me 实测出过 helthing/sounds/thanks/something,
+    // 甚至中文 "邓"), 同一段会话内才稳定。所以别名只能治标, 只补实测见过的,
+    // 不要凭空猜, 更不要为了覆盖面收裸词。
     {"welcome forward", BRIDGE_MOTION_WALK, 4, 700, 70},
 
     // —— 转向 (方向在下面按"左"字判定, 所以这里左右共用规则) ——
@@ -392,10 +416,18 @@ const IntentRule kIntentTable[] = {
     {"tremble",  BRIDGE_MOTION_SHIVER,     5, 280,  85},
     {"shake",    BRIDGE_MOTION_SHIVER,     5, 280,  85},
     {"wag your tail", BRIDGE_MOTION_WAG_TAIL, 4, 320, 90},
+    // ASR 容错: "wag your tail" 连干净 TTS 音频都会被听成 "wet your tail",
+    // 是这批测试里唯一一句模型本身就认不准的。只收整个词组 —— 裸的 "wet"
+    // 是常用词 ("the floor is wet"), 会误伤。
+    {"wet your tail", BRIDGE_MOTION_WAG_TAIL, 4, 320, 90},
     {"wag",      BRIDGE_MOTION_WAG_TAIL,   4, 320,  90},
 
     // —— 兜底的泛化单词, 一定放最后 ——
     {"走",       BRIDGE_MOTION_WALK,       3, 700,  70},
+    // 裸的 "跳": 上面只有 "跳一下/跳一跳/跳起来/原地跳", "跳3下" 这种带数字的
+    // 说法一条都命中不了 (ParseCount 的注释本来就拿它当例子)。"跳舞" 排在前面,
+    // 不会被这条抢走。
+    {"跳",       BRIDGE_MOTION_JUMP,       2, 450,  80},
     {"尾巴",     BRIDGE_MOTION_WAG_TAIL,   3, 350,  85},
     // 和中文的 "走" 同样是宽泛兜底: "let's go" 这类闲聊也会命中。中文那边
     // 已经接受了这个代价, 英文保持一致。真嫌吵就把这两条删掉。
@@ -592,8 +624,12 @@ void EyeMotion::MarkPlayedLocally(bridge_motion_action_t action) {
 }
 
 bool EyeMotion::RecentlyPlayedLocally(bridge_motion_action_t action) {
-    // 3 秒: 服务端 LLM 的工具回调通常在 1-2 秒内到, 再久就该当成新的一次命令。
-    const int64_t kWindowUs = 3 * 1000 * 1000;
+    // 8 秒。原来是 3 秒 ("LLM 回调通常 1-2 秒内到"), 但实测英文长句会拖到
+    // 6.9 秒 —— ASR 把重复的话连成一整句 ("Thanks for me. dance for me.
+    // dance for me..."), 模型处理慢, 回调落在 3 秒窗口外, 同一个动作播了两遍。
+    // 放宽的代价是 8 秒内故意重复的同一指令只播一次; 但用户重复本来就是因为
+    // 第一次没反应, 吞掉重复正是想要的行为。
+    const int64_t kWindowUs = 8 * 1000 * 1000;
     std::lock_guard<std::mutex> lk(mutex_);
     if (local_action_ != action) return false;
     int64_t dt = esp_timer_get_time() - local_action_us_;
