@@ -4,6 +4,7 @@
 #include "eye_motion.h"
 
 #include <cctype>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 
@@ -199,6 +200,42 @@ struct IntentRule {
     int                    amount;
 };
 
+// 只把 A-Z 压成小写, 不碰多字节。用 std::tolower 逐字节扫 UTF-8 是危险的:
+// 汉字的续接字节 >127, 在非 C 区域下可能被改掉。
+std::string LowerAscii(const std::string& s) {
+    std::string r = s;
+    for (char& c : r) {
+        if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
+    }
+    return r;
+}
+
+bool IsAsciiKeyword(const char* k) {
+    for (const char* p = k; *p != '\0'; ++p) {
+        if (static_cast<unsigned char>(*p) > 127) return false;
+    }
+    return true;
+}
+
+// 中文按子串找; 英文必须按词边界找 —— 英文子串会大面积误伤:
+// "visit" 里有 "sit", "sidewalk" 里有 "walk", "going" 里有 "go"。
+size_t FindKeyword(const std::string& t, const char* kw) {
+    if (!IsAsciiKeyword(kw)) return t.find(kw);
+
+    const size_t len = strlen(kw);
+    for (size_t from = 0;;) {
+        size_t p = t.find(kw, from);
+        if (p == std::string::npos) return p;
+
+        bool left_ok  = (p == 0) ||
+                        !isalnum(static_cast<unsigned char>(t[p - 1]));
+        bool right_ok = (p + len >= t.size()) ||
+                        !isalnum(static_cast<unsigned char>(t[p + len]));
+        if (left_ok && right_ok) return p;
+        from = p + 1;
+    }
+}
+
 // 顺序即优先级, 第一条命中的赢。所以:
 //   * "停" 类放最前 —— 任何时候都要能叫停
 //   * "跳舞" 必须排在 "跳" 前面, 否则 "跳个舞" 会被当成蹦跳
@@ -210,12 +247,20 @@ const IntentRule kIntentTable[] = {
     {"别动",     kIntentStop,              0, 0,    0},
     {"不要动",   kIntentStop,              0, 0,    0},
     {"停一下",   kIntentStop,              0, 0,    0},
+    {"stop",     kIntentStop,              0, 0,    0},
+    {"freeze",   kIntentStop,              0, 0,    0},
+    {"hold still", kIntentStop,            0, 0,    0},
+    {"stay still", kIntentStop,            0, 0,    0},
+    {"don't move", kIntentStop,            0, 0,    0},
 
     // —— 站起/归位 ——
     {"站起来",   BRIDGE_MOTION_HOME,       1, 500,  0},
     {"起立",     BRIDGE_MOTION_HOME,       1, 500,  0},
     {"站好",     BRIDGE_MOTION_HOME,       1, 500,  0},
     {"站直",     BRIDGE_MOTION_HOME,       1, 500,  0},
+    {"stand up", BRIDGE_MOTION_HOME,       1, 500,  0},
+    {"get up",   BRIDGE_MOTION_HOME,       1, 500,  0},
+    {"stand",    BRIDGE_MOTION_HOME,       1, 500,  0},
 
     // —— 跳舞 (必须在"跳"之前) ——
     {"跳舞",     BRIDGE_MOTION_DANCE,      3, 700,  75},
@@ -223,6 +268,11 @@ const IntentRule kIntentTable[] = {
     {"来段舞",   BRIDGE_MOTION_DANCE,      3, 700,  75},
     {"舞蹈",     BRIDGE_MOTION_DANCE,      3, 700,  75},
     {"扭一扭",   BRIDGE_MOTION_DANCE,      3, 650,  70},
+    {"dance",    BRIDGE_MOTION_DANCE,      3, 700,  75},
+    {"dancing",  BRIDGE_MOTION_DANCE,      3, 700,  75},
+    {"perform",  BRIDGE_MOTION_DANCE,      3, 700,  75},
+    {"do a trick", BRIDGE_MOTION_DANCE,    3, 700,  75},
+    {"show me a trick", BRIDGE_MOTION_DANCE, 3, 700, 75},
 
     // —— 行走 (四肢) ——
     {"往前走",   BRIDGE_MOTION_WALK,       4, 700,  70},
@@ -238,6 +288,19 @@ const IntentRule kIntentTable[] = {
     {"走起来",   BRIDGE_MOTION_WALK,       4, 700,  70},
     {"走路",     BRIDGE_MOTION_WALK,       4, 700,  70},
     {"过来",     BRIDGE_MOTION_WALK,       4, 650,  75},
+    {"walk forward", BRIDGE_MOTION_WALK,   4, 700,  70},
+    {"go forward",   BRIDGE_MOTION_WALK,   4, 700,  70},
+    {"move forward", BRIDGE_MOTION_WALK,   4, 700,  70},
+    {"walk backward", BRIDGE_MOTION_WALK,  3, 700,  70},
+    {"go backward",  BRIDGE_MOTION_WALK,   3, 700,  70},
+    {"back up",      BRIDGE_MOTION_WALK,   3, 700,  70},
+    {"step back",    BRIDGE_MOTION_WALK,   3, 700,  70},
+    {"come here",    BRIDGE_MOTION_WALK,   4, 650,  75},
+    {"come over",    BRIDGE_MOTION_WALK,   4, 650,  75},
+    {"walk",         BRIDGE_MOTION_WALK,   4, 700,  70},
+    // ASR 容错: 实测 "walk forward" 被听成 "welcome forward all that"。
+    // 这类词组在正常对话里不成句, 拿来当指令不会误伤。
+    {"welcome forward", BRIDGE_MOTION_WALK, 4, 700, 70},
 
     // —— 转向 (方向在下面按"左"字判定, 所以这里左右共用规则) ——
     {"向左转",   BRIDGE_MOTION_TURN,       3, 700,  75},
@@ -260,6 +323,12 @@ const IntentRule kIntentTable[] = {
     {"转一圈",   BRIDGE_MOTION_TURN,       6, 650,  80},
     {"转个圈",   BRIDGE_MOTION_TURN,       6, 650,  80},
     {"转身",     BRIDGE_MOTION_TURN,       4, 700,  80},
+    {"turn left",   BRIDGE_MOTION_TURN,    3, 700,  75},
+    {"turn right",  BRIDGE_MOTION_TURN,    3, 700,  75},
+    {"turn around", BRIDGE_MOTION_TURN,    6, 700,  80},
+    {"spin around", BRIDGE_MOTION_TURN,    6, 650,  80},
+    {"spin",        BRIDGE_MOTION_TURN,    6, 650,  80},
+    {"turn",        BRIDGE_MOTION_TURN,    3, 700,  75},
 
     // —— 蹦跳 ——
     {"跳一下",   BRIDGE_MOTION_JUMP,       2, 450,  80},
@@ -267,6 +336,8 @@ const IntentRule kIntentTable[] = {
     {"跳起来",   BRIDGE_MOTION_JUMP,       2, 450,  85},
     {"原地跳",   BRIDGE_MOTION_JUMP,       3, 450,  80},
     {"蹦",       BRIDGE_MOTION_JUMP,       2, 450,  80},
+    {"jump",     BRIDGE_MOTION_JUMP,       2, 450,  80},
+    {"hop",      BRIDGE_MOTION_JUMP,       2, 450,  80},
 
     // —— 静态姿态 ——
     {"坐下",     BRIDGE_MOTION_SIT,        1, 800,  80},
@@ -277,6 +348,13 @@ const IntentRule kIntentTable[] = {
     {"趴着",     BRIDGE_MOTION_LIE,        1, 1200, 80},
     {"睡觉",     BRIDGE_MOTION_LIE,        1, 1500, 85},
     {"休息",     BRIDGE_MOTION_LIE,        1, 1500, 80},
+    {"sit down", BRIDGE_MOTION_SIT,        1, 800,  80},
+    {"sit",      BRIDGE_MOTION_SIT,        1, 800,  80},
+    {"lie down", BRIDGE_MOTION_LIE,        1, 1200, 80},
+    {"lay down", BRIDGE_MOTION_LIE,        1, 1200, 80},
+    {"go to sleep", BRIDGE_MOTION_LIE,     1, 1500, 85},
+    {"take a rest", BRIDGE_MOTION_LIE,     1, 1500, 80},
+    {"sleep",    BRIDGE_MOTION_LIE,        1, 1500, 85},
 
     // —— 上肢 / 招呼 ——
     {"挥挥手",   BRIDGE_MOTION_WAVE,       3, 450,  75},
@@ -286,6 +364,14 @@ const IntentRule kIntentTable[] = {
     {"握手",     BRIDGE_MOTION_WAVE,       2, 500,  70},
     {"抬手",     BRIDGE_MOTION_WAVE,       2, 500,  70},
     {"举手",     BRIDGE_MOTION_WAVE,       2, 500,  70},
+    // "shake hands" 必须排在下面 shiver 的 "shake" 前面, 否则握手会变成发抖
+    {"shake hands", BRIDGE_MOTION_WAVE,    2, 500,  70},
+    {"high five",   BRIDGE_MOTION_WAVE,    2, 500,  70},
+    {"wave",        BRIDGE_MOTION_WAVE,    3, 450,  75},
+    {"say hi",      BRIDGE_MOTION_WAVE,    3, 450,  75},
+    {"say hello",   BRIDGE_MOTION_WAVE,    3, 450,  75},
+    {"raise your paw", BRIDGE_MOTION_WAVE, 2, 500,  70},
+    {"give me your paw", BRIDGE_MOTION_WAVE, 2, 500, 70},
 
     // —— 其它 ——
     {"伸懒腰",   BRIDGE_MOTION_STRETCH,    1, 1600, 80},
@@ -300,22 +386,41 @@ const IntentRule kIntentTable[] = {
     {"摇尾巴",   BRIDGE_MOTION_WAG_TAIL,   4, 320,  90},
     {"甩尾巴",   BRIDGE_MOTION_WAG_TAIL,   4, 320,  90},
     {"晃尾巴",   BRIDGE_MOTION_WAG_TAIL,   4, 320,  90},
+    {"stretch",  BRIDGE_MOTION_STRETCH,    1, 1600, 80},
+    {"nod",      BRIDGE_MOTION_NOD_BODY,   2, 700,  70},
+    {"shiver",   BRIDGE_MOTION_SHIVER,     5, 280,  85},
+    {"tremble",  BRIDGE_MOTION_SHIVER,     5, 280,  85},
+    {"shake",    BRIDGE_MOTION_SHIVER,     5, 280,  85},
+    {"wag your tail", BRIDGE_MOTION_WAG_TAIL, 4, 320, 90},
+    {"wag",      BRIDGE_MOTION_WAG_TAIL,   4, 320,  90},
 
     // —— 兜底的泛化单词, 一定放最后 ——
     {"走",       BRIDGE_MOTION_WALK,       3, 700,  70},
     {"尾巴",     BRIDGE_MOTION_WAG_TAIL,   3, 350,  85},
+    // 和中文的 "走" 同样是宽泛兜底: "let's go" 这类闲聊也会命中。中文那边
+    // 已经接受了这个代价, 英文保持一致。真嫌吵就把这两条删掉。
+    {"go",       BRIDGE_MOTION_WALK,       3, 700,  70},
+    {"tail",     BRIDGE_MOTION_WAG_TAIL,   3, 350,  85},
 };
 
-// 关键词前面 3 个汉字内出现否定词就不触发 —— "别走了"/"不用坐下" 不该动。
+// 关键词前面一小段里出现否定词就不触发 —— "别走了"/"don't sit" 不该动。
 // 停止类规则本身就是否定式, 不走这个检查。
 bool NegatedBefore(const std::string& t, size_t pos) {
-    const size_t kLookBack = 9;   // 3 个汉字 (UTF-8)
+    // 16 字节: 中文 3 个汉字 (9 字节) 够用, 英文要装下 "you don't have to "
+    // 这种前缀, 所以取更宽的窗口。窗口太宽会误杀 ("I don't like carrots,
+    // now dance"), 16 是折中。
+    const size_t kLookBack = 16;
     size_t start = pos > kLookBack ? pos - kLookBack : 0;
     std::string prefix = t.substr(start, pos - start);
-    return prefix.find("不") != std::string::npos ||
-           prefix.find("别") != std::string::npos ||
-           prefix.find("没") != std::string::npos ||
-           prefix.find("无需") != std::string::npos;
+
+    static const char* kNegatives[] = {
+        "不", "别", "没", "无需",
+        "don't", "do not", "dont", "not ", "never", "no need", "stop ",
+    };
+    for (const char* n : kNegatives) {
+        if (prefix.find(n) != std::string::npos) return true;
+    }
+    return false;
 }
 
 // "走两步" / "跳3下" -> 次数。没说次数返回 0 (用规则表的默认值)。
@@ -343,6 +448,36 @@ int ParseCount(const std::string& t) {
             return v;
         }
     }
+
+    // 英文: "twice" / "two steps" / "jump 3 times"
+    if (FindKeyword(t, "twice") != std::string::npos) return 2;
+    if (FindKeyword(t, "once") != std::string::npos) return 1;
+
+    static const struct { const char* w; int v; } kEnDigits[] = {
+        {"one", 1}, {"two", 2}, {"three", 3}, {"four", 4}, {"five", 5},
+        {"six", 6}, {"seven", 7}, {"eight", 8}, {"nine", 9}, {"ten", 10},
+    };
+    // "times" 排在 "time" 前只是为了读着顺 —— FindKeyword 认词边界,
+    // "3 times" 不会被 "time" 命中。
+    static const char* kEnUnits[] = {"times", "time", "steps", "step",
+                                     "laps", "lap", "circles", "circle", "hops"};
+    for (const char* unit : kEnUnits) {
+        size_t p = FindKeyword(t, unit);
+        if (p == std::string::npos || p == 0) continue;
+
+        // 往前跳过空格, 取紧邻的那个词
+        size_t e = p;
+        while (e > 0 && isspace(static_cast<unsigned char>(t[e - 1]))) --e;
+        size_t b = e;
+        while (b > 0 && isalnum(static_cast<unsigned char>(t[b - 1]))) --b;
+        if (b == e) continue;
+
+        std::string word = t.substr(b, e - b);
+        if (isdigit(static_cast<unsigned char>(word[0]))) return atoi(word.c_str());
+        for (const auto& d : kEnDigits) {
+            if (word == d.w) return d.v;
+        }
+    }
     return 0;
 }
 
@@ -352,10 +487,11 @@ int Clamp(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
 
 bool EyeMotion::OnUserText(const char* text) {
     if (text == nullptr || *text == '\0') return false;
-    std::string t(text);
+    // 表里英文关键词一律小写, 先把输入的 A-Z 压平; 中文字节不受影响。
+    std::string t = LowerAscii(text);
 
     for (const auto& rule : kIntentTable) {
-        size_t pos = t.find(rule.keyword);
+        size_t pos = FindKeyword(t, rule.keyword);
         if (pos == std::string::npos) continue;
 
         if (rule.action == kIntentStop) {
@@ -380,12 +516,18 @@ bool EyeMotion::OnUserText(const char* text) {
         if (rule.action == BRIDGE_MOTION_WALK) {
             bool backward = t.find("后") != std::string::npos ||
                             t.find("退") != std::string::npos ||
-                            t.find("倒") != std::string::npos;
+                            t.find("倒") != std::string::npos ||
+                            FindKeyword(t, "back") != std::string::npos ||
+                            FindKeyword(t, "backward") != std::string::npos ||
+                            FindKeyword(t, "backwards") != std::string::npos ||
+                            FindKeyword(t, "reverse") != std::string::npos;
             req.direction = backward ? -1 : 1;
         } else if (rule.action == BRIDGE_MOTION_WAVE ||
                    rule.action == BRIDGE_MOTION_TURN) {
             // 没提左右时默认右 ("转个圈" 这种)。"左转右转" 会认先出现的那个。
-            req.direction = (t.find("左") != std::string::npos) ? -1 : 1;
+            bool left = t.find("左") != std::string::npos ||
+                        FindKeyword(t, "left") != std::string::npos;
+            req.direction = left ? -1 : 1;
         }
 
         // "走两步" / "跳三下"
@@ -394,14 +536,33 @@ bool EyeMotion::OnUserText(const char* text) {
 
         // 程度副词。HOME 没有幅度/次数可调, 跳过。
         if (rule.action != BRIDGE_MOTION_HOME) {
-            if (t.find("快") != std::string::npos)  req.period_ms = req.period_ms * 3 / 5;
-            if (t.find("慢") != std::string::npos)  req.period_ms = req.period_ms * 8 / 5;
+            bool faster = t.find("快") != std::string::npos ||
+                          FindKeyword(t, "fast") != std::string::npos ||
+                          FindKeyword(t, "faster") != std::string::npos ||
+                          FindKeyword(t, "quick") != std::string::npos ||
+                          FindKeyword(t, "quickly") != std::string::npos;
+            bool slower = t.find("慢") != std::string::npos ||
+                          FindKeyword(t, "slow") != std::string::npos ||
+                          FindKeyword(t, "slower") != std::string::npos ||
+                          FindKeyword(t, "slowly") != std::string::npos;
+            if (faster) req.period_ms = req.period_ms * 3 / 5;
+            if (slower) req.period_ms = req.period_ms * 8 / 5;
+
             if (t.find("用力") != std::string::npos || t.find("使劲") != std::string::npos ||
-                t.find("大一点") != std::string::npos || t.find("大点") != std::string::npos) {
+                t.find("大一点") != std::string::npos || t.find("大点") != std::string::npos ||
+                FindKeyword(t, "hard") != std::string::npos ||
+                FindKeyword(t, "harder") != std::string::npos ||
+                FindKeyword(t, "big") != std::string::npos ||
+                FindKeyword(t, "bigger") != std::string::npos) {
                 req.amount = 100;
             }
             if (t.find("轻") != std::string::npos || t.find("小一点") != std::string::npos ||
-                t.find("小点") != std::string::npos) {
+                t.find("小点") != std::string::npos ||
+                FindKeyword(t, "gently") != std::string::npos ||
+                FindKeyword(t, "gentle") != std::string::npos ||
+                FindKeyword(t, "softly") != std::string::npos ||
+                FindKeyword(t, "little") != std::string::npos ||
+                FindKeyword(t, "small") != std::string::npos) {
                 req.amount = 40;
             }
         }
