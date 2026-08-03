@@ -9,6 +9,7 @@
 #include "bridge_internal.h"
 
 #include <string.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <sys/socket.h>
 #include <netdb.h>
@@ -17,6 +18,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
+#include "freertos/queue.h"
 #include "esp_log.h"
 #include "esp_tls.h"
 
@@ -38,10 +40,43 @@ typedef struct {
 static link_t s_links[BRIDGE_MAX_LINKS];
 static SemaphoreHandle_t s_table_lock;
 
+/* ---- 建连请求队列 ----
+ * DNS 解析和 TLS 握手都是秒级的同步阻塞操作。以前它们直接跑在 UART 收帧任务
+ * (bridge_rx) 上: 握手期间 C5 完全不读 UART, 而这根线没有流控、ring buffer 只有
+ * 8192 字节, S3 侧继续发就会溢出丢帧 —— 表现为建连时段的 CRC 错误和音频卡顿。
+ * 现在把建连丢给独立 worker, 收帧任务只负责入队, 永不阻塞。 */
+typedef struct {
+    uint8_t        link_id;
+    bridge_proto_t proto;
+    uint16_t       port;
+    char           host[128];
+} sock_open_req_t;
+
+#define OPEN_QUEUE_LEN   BRIDGE_MAX_LINKS
+
+static QueueHandle_t s_open_queue;
+
+static void sock_open_blocking(uint8_t link_id, bridge_proto_t proto,
+                               const char *host, uint16_t port);
+
+static void sock_open_worker(void *arg)
+{
+    sock_open_req_t req;
+    while (1) {
+        if (xQueueReceive(s_open_queue, &req, portMAX_DELAY) == pdTRUE) {
+            sock_open_blocking(req.link_id, req.proto, req.host, req.port);
+        }
+    }
+}
+
 void bridge_sock_init(void)
 {
     s_table_lock = xSemaphoreCreateMutex();
     memset(s_links, 0, sizeof(s_links));
+
+    s_open_queue = xQueueCreate(OPEN_QUEUE_LEN, sizeof(sock_open_req_t));
+    /* 栈要够 TLS 握手用 (mbedtls 吃栈), 与原先在 rx 任务里的用量对齐 */
+    xTaskCreate(sock_open_worker, "sock_open", 6144, NULL, 10, NULL);
 }
 
 static void send_opened_result(uint8_t link_id, bool ok, int32_t err)
@@ -135,6 +170,7 @@ static void udp_rx_task(void *arg)
     vTaskDelete(NULL);
 }
 
+/* 收帧任务调用: 只占好槽位然后入队, 绝不阻塞。 */
 void bridge_sock_open(uint8_t link_id, bridge_proto_t proto,
                       const char *host, uint16_t port)
 {
@@ -143,6 +179,8 @@ void bridge_sock_open(uint8_t link_id, bridge_proto_t proto,
         return;
     }
 
+    /* 槽位必须在这里就占住 (而不是留给 worker): S3 收到 EVT_SOCK_OPENED 之前
+     * 不会发数据, 但 SOCK_CLOSE 可能随时来, 槽位状态得立刻是一致的。 */
     xSemaphoreTake(s_table_lock, portMAX_DELAY);
     link_t *lk = &s_links[link_id];
     if (lk->used) {                    /* 复用前先清理旧连接 */
@@ -156,6 +194,36 @@ void bridge_sock_open(uint8_t link_id, bridge_proto_t proto,
     lk->closing = false;
     lk->send_lock = xSemaphoreCreateMutex();
     xSemaphoreGive(s_table_lock);
+
+    sock_open_req_t req = {
+        .link_id = link_id,
+        .proto   = proto,
+        .port    = port,
+    };
+    snprintf(req.host, sizeof(req.host), "%s", host);
+
+    /* 队列长度等于 link 数, 且每条 link 同时只会有一个未完成的 open,
+     * 正常情况下不可能满。满了说明状态不一致, 直接回失败而不是阻塞。 */
+    if (xQueueSend(s_open_queue, &req, 0) != pdTRUE) {
+        ESP_LOGE(TAG, "open queue full, link=%u", link_id);
+        xSemaphoreTake(s_table_lock, portMAX_DELAY);
+        link_free_locked(lk);
+        xSemaphoreGive(s_table_lock);
+        send_opened_result(link_id, false, -7);
+    }
+}
+
+/* worker 任务调用: 这里可以放心阻塞 (DNS / TLS 握手)。 */
+static void sock_open_blocking(uint8_t link_id, bridge_proto_t proto,
+                               const char *host, uint16_t port)
+{
+    link_t *lk = &s_links[link_id];
+
+    /* 入队后到这里之前, S3 可能已经发了 SOCK_CLOSE。那就别再建连了。 */
+    if (!lk->used || lk->closing) {
+        ESP_LOGW(TAG, "open aborted before start, link=%u", link_id);
+        return;
+    }
 
     if (proto == BRIDGE_PROTO_TCP || proto == BRIDGE_PROTO_TLS) {
         esp_tls_cfg_t cfg = {0};

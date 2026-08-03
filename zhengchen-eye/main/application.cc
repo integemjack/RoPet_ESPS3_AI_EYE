@@ -383,7 +383,15 @@ void Application::Start() {
         xEventGroupSetBits(event_group_, MAIN_EVENT_ERROR);
     });
     protocol_->OnIncomingAudio([this](std::unique_ptr<AudioStreamPacket> packet) {
-        if (device_state_ == kDeviceStateSpeaking) {
+        // 音频走 UDP, 而通知 TTS 开始的 JSON 走 MQTT/TCP —— 两条独立通道, UDP 首包
+        // 完全可能先到。如果这里只认 kDeviceStateSpeaking, 那么"tts start 还没到"
+        // 期间的包会被静默丢掉, 每帧 60ms, 丢几帧就是几百毫秒的首字延迟。
+        // 所以 Listening 状态也收下, 让它们在解码队列里等着。
+        // aborted_ 时不收: 用户已经打断, 剩下的音频不该再播。
+        if (aborted_) {
+            return;
+        }
+        if (device_state_ == kDeviceStateSpeaking || device_state_ == kDeviceStateListening) {
             audio_service_.PushPacketToDecodeQueue(std::move(packet));
         }
     });
@@ -622,9 +630,18 @@ void Application::AbortSpeaking(AbortReason reason) {
     ESP_LOGI(TAG, "Abort speaking");
     aborted_ = true;
     protocol_->SendAbortSpeaking(reason);
+    // 立刻丢掉已经排队但还没播出的音频。原来靠下一次进 Speaking 时的
+    // ResetDecoder 顺带清理, 但那个调用已经移除 (它会误删 TTS 首包),
+    // 所以打断路径必须自己清。
+    audio_service_.ResetDecoder();
 }
 
 void Application::SetListeningMode(ListeningMode mode) {
+    // 新一轮收听开始, 清掉打断标志。
+    // aborted_ 现在会被 OnIncomingAudio 用来丢弃打断后的残留音频, 所以必须在
+    // 这里可靠复位 —— 只靠 tts start 里那次复位是不够的: 若首包早于 tts start
+    // 到达 (这正是常见情况), 它会被上一轮的 aborted_ 误杀。
+    aborted_ = false;
     listening_mode_ = mode;
     SetDeviceState(kDeviceStateListening);
 }
@@ -683,7 +700,14 @@ void Application::SetDeviceState(DeviceState state) {
                 audio_service_.EnableWakeWordDetection(false);
 #endif
             }
-            audio_service_.ResetDecoder();
+            // 这里原来有一个 ResetDecoder()。它会清空 decode/playback 队列, 而
+            // "tts start 之前先到的 UDP 音频包"正好就在这两个队列里 —— 于是刚
+            // 抢救回来的首包又被清掉了, 白等一次。
+            //
+            // 残留音频的清理已经有别的地方负责:
+            //   - 进 Listening 时 EnableVoiceProcessing(true) 内部会 ResetDecoder
+            //   - 打断时 AbortSpeaking() 显式 ResetDecoder
+            // 所以这里不需要再清一次。
             break;
         default:
             // Do nothing
