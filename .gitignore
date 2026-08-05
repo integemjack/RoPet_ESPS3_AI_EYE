@@ -21,3 +21,4 @@ scripts/flasher/__pycache__/
 scripts/flasher/firmware/
 zhengchen-eye/release/
 zhengchen-eye/target.bin
+zhengchen-eye/build_verify/
