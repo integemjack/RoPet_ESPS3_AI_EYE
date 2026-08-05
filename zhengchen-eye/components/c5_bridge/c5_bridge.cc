@@ -94,6 +94,10 @@ void C5Bridge::RxTaskEntry(void* arg) {
     static_cast<C5Bridge*>(arg)->RxTask();
 }
 
+// 帧间超时: 一帧开始解析后, 若这么久没有新字节到达, 就判定这帧已经断了。
+// 与 C5 侧 bridge_uart.c 的 RX_FRAME_TIMEOUT_MS 保持一致。
+#define RX_FRAME_TIMEOUT_MS  50
+
 void C5Bridge::RxTask() {
     enum { ST_M0, ST_M1, ST_TYPE, ST_LINK, ST_L0, ST_L1, ST_PL, ST_C0, ST_C1 } st = ST_M0;
     static uint8_t payload[BRIDGE_MAX_PAYLOAD];
@@ -102,10 +106,25 @@ void C5Bridge::RxTask() {
     uint16_t len = 0, idx = 0, rx_crc = 0;
 
     while (true) {
-        // 批量读取: 先阻塞等 1 字节 (避免凑不满整块而永久阻塞),
-        // 再用 0 超时把 ring buffer 里已到的其余字节一次取走。
-        int got = uart_read_bytes(uart_port_, rxbuf, 1, portMAX_DELAY);
-        if (got <= 0) continue;
+        // 批量读取: 先等 1 字节, 再用 0 超时把 ring buffer 里已到的其余字节
+        // 一次取走。
+        //
+        // 半帧未完时不能无限阻塞: C5 复位 (配网完成、CMD_RESET) 会让线上留下
+        // 半截帧, 剩余字节永远不会来。状态机若一直卡在 ST_PL 等那些字节, 就会
+        // 把 C5 重启后发来的真实帧当成缺失的 payload 吞掉 —— 最坏 len 被解析成
+        // 4096, 921600bps 下相当于吞掉约 44ms 的数据。所以此时改用有限超时,
+        // 超时即重新同步。正常帧整帧一次写出, 字节间隔远小于此, 不会误伤。
+        TickType_t wait = (st == ST_M0) ? portMAX_DELAY
+                                        : pdMS_TO_TICKS(RX_FRAME_TIMEOUT_MS);
+        int got = uart_read_bytes(uart_port_, rxbuf, 1, wait);
+        if (got <= 0) {
+            if (st != ST_M0) {
+                ESP_LOGW(TAG, "frame timeout in state %d (type=0x%02x len=%u idx=%u), resync",
+                         (int)st, type, len, idx);
+                st = ST_M0;
+            }
+            continue;
+        }
         int more = uart_read_bytes(uart_port_, rxbuf + 1, sizeof(rxbuf) - 1, 0);
         if (more > 0) got += more;
 

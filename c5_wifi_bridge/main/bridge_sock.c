@@ -35,6 +35,16 @@ typedef struct {
     TaskHandle_t   rx_task;
     SemaphoreHandle_t send_lock;
     volatile bool  closing;
+    /* 槽位世代号: 每次 bridge_sock_open 复用槽位时 +1。
+     *
+     * 用来解决一个竞态: S3 单独重启 (C5 不重启) 时会复用同一个 link_id, 而上一
+     * 条连接的 rx_task 可能还阻塞在 read 里没退出。等它醒来时槽位已经被新连接
+     * 接管, 它却以为这还是自己的槽位, 于是 link_free_locked() 把新状态抹掉、
+     * 再报一个 EVT_SOCK_CLOSED。随后 worker 看到 !used 就 "open aborted",
+     * 什么结果都不回, S3 只能干等满 15 秒连接超时。
+     *
+     * rx_task 启动时记下自己的世代, 退出时只有世代仍匹配才清理/上报。 */
+    uint32_t       generation;
 } link_t;
 
 static link_t s_links[BRIDGE_MAX_LINKS];
@@ -49,6 +59,7 @@ typedef struct {
     uint8_t        link_id;
     bridge_proto_t proto;
     uint16_t       port;
+    uint32_t       generation;   /* 入队时的槽位世代, 用于识别请求是否已过期 */
     char           host[128];
 } sock_open_req_t;
 
@@ -57,14 +68,15 @@ typedef struct {
 static QueueHandle_t s_open_queue;
 
 static void sock_open_blocking(uint8_t link_id, bridge_proto_t proto,
-                               const char *host, uint16_t port);
+                               const char *host, uint16_t port, uint32_t generation);
 
 static void sock_open_worker(void *arg)
 {
     sock_open_req_t req;
     while (1) {
         if (xQueueReceive(s_open_queue, &req, portMAX_DELAY) == pdTRUE) {
-            sock_open_blocking(req.link_id, req.proto, req.host, req.port);
+            sock_open_blocking(req.link_id, req.proto, req.host, req.port,
+                               req.generation);
         }
     }
 }
@@ -109,64 +121,132 @@ static void link_free_locked(link_t *lk)
     lk->rx_task = NULL;
 }
 
-/* ---- TCP/TLS 接收任务 ---- */
-static void tls_rx_task(void *arg)
+/* rx_task 的参数把 link_id 和世代号打包进一个指针, 免得再分配内存。 */
+#define RX_ARG_PACK(link_id, gen)  ((void *)(uintptr_t)(((uint32_t)(gen) << 8) | (link_id)))
+#define RX_ARG_LINK(arg)           ((uint8_t)((uintptr_t)(arg) & 0xFF))
+#define RX_ARG_GEN(arg)            ((uint32_t)((uintptr_t)(arg) >> 8))
+
+/* rx_task 退出时的收尾: 只有槽位还属于本世代才清理并上报。
+ * 返回 true 表示需要通知 S3 (被动关闭)。 */
+static bool rx_task_finish(uint8_t link_id, uint32_t my_gen)
 {
-    uint8_t link_id = (uint8_t)(uintptr_t)arg;
-    link_t *lk = &s_links[link_id];
-    uint8_t *buf = malloc(RX_CHUNK);
-    if (!buf) { vTaskDelete(NULL); return; }
-
-    while (!lk->closing) {
-        int n = esp_tls_conn_read(lk->tls, buf, RX_CHUNK);
-        if (n > 0) {
-            bridge_send_frame(BRIDGE_EVT_SOCK_DATA, link_id, buf, (uint16_t)n);
-        } else if (n == 0 || (n != ESP_TLS_ERR_SSL_WANT_READ && n != ESP_TLS_ERR_SSL_WANT_WRITE)) {
-            /* 远端关闭或错误 */
-            break;
-        }
-    }
-    free(buf);
-
     bool report = false;
     xSemaphoreTake(s_table_lock, portMAX_DELAY);
+    link_t *lk = &s_links[link_id];
+    if (lk->generation != my_gen) {
+        /* 槽位已被新连接接管 —— 什么都别动, 否则会抹掉新状态。 */
+        xSemaphoreGive(s_table_lock);
+        ESP_LOGW(TAG, "link=%u stale rx task (gen=%lu, now=%lu) exiting quietly",
+                 link_id, (unsigned long)my_gen, (unsigned long)lk->generation);
+        return false;
+    }
     if (lk->used && !lk->closing) {
         report = true;                 /* 被动关闭, 需通知 S3 */
     }
     link_free_locked(lk);
     xSemaphoreGive(s_table_lock);
+    return report;
+}
 
-    if (report) notify_closed(link_id);
+/* ---- TCP/TLS 接收任务 ---- */
+static void tls_rx_task(void *arg)
+{
+    uint8_t link_id = RX_ARG_LINK(arg);
+    uint32_t my_gen = RX_ARG_GEN(arg);
+    link_t *lk = &s_links[link_id];
+    uint8_t *buf = malloc(RX_CHUNK);
+    if (!buf) { vTaskDelete(NULL); return; }
+
+    int last_n = 0;          /* 退出循环时 esp_tls_conn_read 的返回值 */
+    int last_errno = 0;
+    uint32_t total_rx = 0;   /* 本条连接累计收到的字节数 */
+
+    while (!lk->closing) {
+        errno = 0;
+        int n = esp_tls_conn_read(lk->tls, buf, RX_CHUNK);
+        if (n > 0) {
+            total_rx += (uint32_t)n;
+            bridge_send_frame(BRIDGE_EVT_SOCK_DATA, link_id, buf, (uint16_t)n);
+            continue;
+        }
+        if (n == 0) {
+            last_n = 0;          /* 远端正常关闭 (FIN) */
+            break;
+        }
+
+        /* n < 0: 要区分"暂时没数据"和"真出错"。
+         *
+         * 这里原来只认 mbedtls 的 ESP_TLS_ERR_SSL_WANT_READ/WANT_WRITE (-0x6900
+         * 一类的常量)。但明文 TCP 走的是 cfg.is_plain_tcp = true, 底层就是裸
+         * socket, 无数据可读时返回 -1/EAGAIN —— 和那两个常量根本不相等, 于是
+         * 每次读空窗口都被当成致命错误 break 掉, 表现为 WebSocket 隔十几秒
+         * 莫名断开一次 (间隔取决于流量节奏, 不是定时器)。
+         *
+         * 所以两种模式都要放过: TLS 认 mbedtls 的 WANT_*, 明文 TCP 认
+         * EAGAIN/EWOULDBLOCK/EINTR (与下面 udp_rx_task 的处理一致)。 */
+        if (n == ESP_TLS_ERR_SSL_WANT_READ || n == ESP_TLS_ERR_SSL_WANT_WRITE) {
+            continue;
+        }
+        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+            /* 非阻塞 socket 的读空窗口。让出 CPU 再试, 否则这里会空转成忙等。 */
+            vTaskDelay(1);
+            continue;
+        }
+
+        last_n = n;
+        last_errno = errno;
+        break;
+    }
+    free(buf);
+
+    if (!lk->closing) {
+        if (last_n == 0) {
+            ESP_LOGW(TAG, "link=%u closed by peer (FIN), rx_total=%lu",
+                     link_id, (unsigned long)total_rx);
+        } else {
+            ESP_LOGW(TAG, "link=%u read error n=%d (-0x%X) errno=%d (%s), rx_total=%lu",
+                     link_id, last_n, -last_n, last_errno, strerror(last_errno),
+                     (unsigned long)total_rx);
+        }
+    }
+
+    if (rx_task_finish(link_id, my_gen)) notify_closed(link_id);
     vTaskDelete(NULL);
 }
 
 /* ---- UDP 接收任务 ---- */
 static void udp_rx_task(void *arg)
 {
-    uint8_t link_id = (uint8_t)(uintptr_t)arg;
+    uint8_t link_id = RX_ARG_LINK(arg);
+    uint32_t my_gen = RX_ARG_GEN(arg);
     link_t *lk = &s_links[link_id];
     uint8_t *buf = malloc(RX_CHUNK);
     if (!buf) { vTaskDelete(NULL); return; }
 
+    int last_n = 0;
+    int last_errno = 0;
+
     while (!lk->closing) {
+        errno = 0;
         int n = recv(lk->udp_fd, buf, RX_CHUNK, 0);
         if (n > 0) {
             bridge_send_frame(BRIDGE_EVT_SOCK_DATA, link_id, buf, (uint16_t)n);
         } else if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) {
             continue;
         } else {
+            last_n = n;
+            last_errno = errno;
             break;
         }
     }
     free(buf);
 
-    bool report = false;
-    xSemaphoreTake(s_table_lock, portMAX_DELAY);
-    if (lk->used && !lk->closing) report = true;
-    link_free_locked(lk);
-    xSemaphoreGive(s_table_lock);
+    if (!lk->closing) {
+        ESP_LOGW(TAG, "link=%u udp recv ended n=%d errno=%d (%s)",
+                 link_id, last_n, last_errno, strerror(last_errno));
+    }
 
-    if (report) notify_closed(link_id);
+    if (rx_task_finish(link_id, my_gen)) notify_closed(link_id);
     vTaskDelete(NULL);
 }
 
@@ -187,7 +267,11 @@ void bridge_sock_open(uint8_t link_id, bridge_proto_t proto,
         lk->closing = true;
         link_free_locked(lk);
     }
+    /* 世代号要跨 memset 保留并递增: 旧连接的 rx_task 可能还没退出, 靠这个值
+     * 才能认出"槽位已经不是我的了"。 */
+    uint32_t next_gen = lk->generation + 1;
     memset(lk, 0, sizeof(*lk));
+    lk->generation = next_gen;
     lk->udp_fd = -1;
     lk->proto = proto;
     lk->used = true;
@@ -199,6 +283,7 @@ void bridge_sock_open(uint8_t link_id, bridge_proto_t proto,
         .link_id = link_id,
         .proto   = proto,
         .port    = port,
+        .generation = next_gen,
     };
     snprintf(req.host, sizeof(req.host), "%s", host);
 
@@ -215,13 +300,27 @@ void bridge_sock_open(uint8_t link_id, bridge_proto_t proto,
 
 /* worker 任务调用: 这里可以放心阻塞 (DNS / TLS 握手)。 */
 static void sock_open_blocking(uint8_t link_id, bridge_proto_t proto,
-                               const char *host, uint16_t port)
+                               const char *host, uint16_t port, uint32_t generation)
 {
     link_t *lk = &s_links[link_id];
 
-    /* 入队后到这里之前, S3 可能已经发了 SOCK_CLOSE。那就别再建连了。 */
+    /* 世代对不上: 这个 open 请求已经被更新的一次 open 取代了。新请求会自己回
+     * 结果, 这里必须保持沉默, 否则会抢答。 */
+    if (lk->generation != generation) {
+        ESP_LOGW(TAG, "open request superseded, link=%u (req gen=%lu, now=%lu)",
+                 link_id, (unsigned long)generation, (unsigned long)lk->generation);
+        return;
+    }
+
+    /* 入队后到这里之前, S3 可能已经发了 SOCK_CLOSE。那就别再建连了。
+     *
+     * 注意必须回一个失败结果: 以前这里直接 return, 而 S3 的 C5Tcp::Connect()
+     * 在等 EVT_SOCK_OPENED, 等不到就要干耗满 15 秒超时。开机时 S3 单独重启
+     * (C5 不重启) 复用 link 0 就会踩到, 表现为 "C5Tcp: connect timeout" +
+     * OTA 检查失败告警。 */
     if (!lk->used || lk->closing) {
         ESP_LOGW(TAG, "open aborted before start, link=%u", link_id);
+        send_opened_result(link_id, false, -8);
         return;
     }
 
@@ -257,7 +356,8 @@ static void sock_open_blocking(uint8_t link_id, bridge_proto_t proto,
         }
         lk->tls = tls;
         send_opened_result(link_id, true, 0);
-        xTaskCreate(tls_rx_task, "lk_tls", 6144, (void *)(uintptr_t)link_id, 11, &lk->rx_task);
+        xTaskCreate(tls_rx_task, "lk_tls", 6144, RX_ARG_PACK(link_id, generation),
+                    11, &lk->rx_task);
 
     } else { /* UDP */
         struct addrinfo hints = { .ai_family = AF_INET, .ai_socktype = SOCK_DGRAM };
@@ -293,7 +393,8 @@ static void sock_open_blocking(uint8_t link_id, bridge_proto_t proto,
         freeaddrinfo(res);
         lk->udp_fd = fd;
         send_opened_result(link_id, true, 0);
-        xTaskCreate(udp_rx_task, "lk_udp", 4096, (void *)(uintptr_t)link_id, 11, &lk->rx_task);
+        xTaskCreate(udp_rx_task, "lk_udp", 4096, RX_ARG_PACK(link_id, generation),
+                    11, &lk->rx_task);
     }
 }
 
@@ -332,6 +433,7 @@ void bridge_sock_close(uint8_t link_id)
         xSemaphoreGive(s_table_lock);
         return;
     }
+    ESP_LOGW(TAG, "link=%u close requested by S3", link_id);
     lk->closing = true;      /* 通知 rx_task 退出 */
     /* 主动关闭底层 fd 以唤醒阻塞的 recv/read */
     if (lk->udp_fd >= 0) {

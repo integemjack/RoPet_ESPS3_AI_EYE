@@ -105,6 +105,18 @@ typedef enum {
 
 #define RX_READ_CHUNK  512   /* 每次尝试从 UART 批量读取的字节数 */
 
+/* 帧间超时: 一帧开始解析后, 若这么久没有新字节到达, 就判定这帧已经断了,
+ * 强制回到找 magic 的状态。
+ *
+ * 为什么需要: S3 复位时线上可能正传一帧到一半, 剩余字节永远不会来。状态机
+ * 会一直卡在 ST_PAYLOAD 等那些字节, 然后把 S3 重启后发来的**真实帧**当成缺失
+ * 的 payload 吞掉。最坏情况 len 被解析成 4096, 在 921600bps 下相当于吞掉约
+ * 44ms 的数据 —— 如果被吞的正好是 SOCK_OPEN, S3 那边就要干等满 15 秒连接超时。
+ *
+ * 加了这个超时后, 最坏只会吞掉这个窗口内的字节。正常帧的字节是连续到达的
+ * (整帧一次 write 出去), 相邻字节间隔远小于此, 不会误伤。 */
+#define RX_FRAME_TIMEOUT_MS  50
+
 static void rx_task(void *arg)
 {
     static uint8_t payload[BRIDGE_MAX_PAYLOAD];
@@ -115,10 +127,23 @@ static void rx_task(void *arg)
     uint16_t rx_crc = 0;
 
     while (1) {
-        /* 批量读取: 先阻塞等 1 字节 (避免凑不满整块而永久阻塞),
-         * 再用 0 超时把 ring buffer 里已到的其余字节一次取走。 */
-        int got = uart_read_bytes(BRIDGE_UART_PORT, rxbuf, 1, portMAX_DELAY);
-        if (got <= 0) continue;
+        /* 批量读取: 先等 1 字节, 再用 0 超时把 ring buffer 里已到的其余字节
+         * 一次取走。
+         *
+         * 半帧未完时不能无限阻塞 —— 否则卡住的状态机要等到下一帧到来才被发现,
+         * 那时错位已经发生了。所以此时改用有限超时, 超时即重新同步。 */
+        TickType_t wait = (st == ST_MAGIC0)
+                              ? portMAX_DELAY
+                              : pdMS_TO_TICKS(RX_FRAME_TIMEOUT_MS);
+        int got = uart_read_bytes(BRIDGE_UART_PORT, rxbuf, 1, wait);
+        if (got <= 0) {
+            if (st != ST_MAGIC0) {
+                ESP_LOGW(TAG, "frame timeout in state %d (type=0x%02x len=%u idx=%u), resync",
+                         (int)st, type, len, idx);
+                st = ST_MAGIC0;
+            }
+            continue;
+        }
         int more = uart_read_bytes(BRIDGE_UART_PORT, rxbuf + 1, RX_READ_CHUNK - 1, 0);
         if (more > 0) got += more;
 

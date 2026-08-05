@@ -8,6 +8,7 @@
 #include <cJSON.h>
 #include <esp_log.h>
 #include <arpa/inet.h>
+#include <freertos/task.h>
 #include "assets/lang_config.h"
 
 #define TAG "WS"
@@ -76,13 +77,18 @@ bool WebsocketProtocol::IsAudioChannelOpened() const {
 }
 
 void WebsocketProtocol::CloseAudioChannel() {
+    closing_ = true;
+    if (websocket_ != nullptr) {
+        websocket_->Close();
+    }
     websocket_.reset();
+    closing_ = false;
 }
 
 bool WebsocketProtocol::OpenAudioChannel() {
     Settings settings("websocket", false);
-    std::string url = settings.GetString("url");
-    std::string token = settings.GetString("token");
+    url_ = settings.GetString("url");
+    token_ = settings.GetString("token");
     int version = settings.GetInt("version");
     if (version != 0) {
         version_ = version;
@@ -90,13 +96,27 @@ bool WebsocketProtocol::OpenAudioChannel() {
 
     error_occurred_ = false;
 
-    auto network = Board::GetInstance().GetNetwork();
-    websocket_ = network->CreateWebSocket(1);
-    if (websocket_ == nullptr) {
-        ESP_LOGE(TAG, "Failed to create websocket");
+    if (!EstablishConnection()) {
         return false;
     }
 
+    if (on_audio_channel_opened_ != nullptr) {
+        on_audio_channel_opened_();
+    }
+
+    return true;
+}
+
+/* 建立一条连接并完成 hello 交换。重连时复用, 所以不碰 on_audio_channel_opened_ /
+ * on_audio_channel_closed_ —— 那两个是"会话级"事件, 由调用方决定何时触发。 */
+bool WebsocketProtocol::EstablishConnection() {
+    /* 直接构造 WsClient 而不走 NetworkInterface::CreateWebSocket(): 后者返回的是
+     * esp-ml307 自带的 WebSocket, 帧长度解析有符号位 bug 且无心跳。WsClient 只
+     * 需要 NetworkInterface 的 CreateTcp/CreateSsl。 */
+    auto network = Board::GetInstance().GetNetwork();
+    websocket_ = std::make_unique<WsClient>(network, 1);
+
+    std::string token = token_;
     if (!token.empty()) {
         // If token not has a space, add "Bearer " prefix
         if (token.find(" ") == std::string::npos) {
@@ -107,6 +127,8 @@ bool WebsocketProtocol::OpenAudioChannel() {
     websocket_->SetHeader("Protocol-Version", std::to_string(version_).c_str());
     websocket_->SetHeader("Device-Id", SystemInfo::GetMacAddress().c_str());
     websocket_->SetHeader("Client-Id", Board::GetInstance().GetUuid().c_str());
+
+    websocket_->EnableHeartbeat(WEBSOCKET_PING_INTERVAL_SECONDS, WEBSOCKET_PING_TIMEOUT_SECONDS);
 
     websocket_->OnData([this](const char* data, size_t len, bool binary) {
         if (binary) {
@@ -164,19 +186,18 @@ bool WebsocketProtocol::OpenAudioChannel() {
         last_incoming_time_ = std::chrono::steady_clock::now();
     });
 
-    websocket_->OnDisconnected([this]() {
-        ESP_LOGI(TAG, "Websocket disconnected");
-        if (on_audio_channel_closed_ != nullptr) {
-            on_audio_channel_closed_();
-        }
+    websocket_->OnDisconnected([this](WsCloseReason reason) {
+        HandleDisconnected(reason);
     });
 
-    ESP_LOGI(TAG, "Connecting to websocket server: %s with version: %d", url.c_str(), version_);
-    if (!websocket_->Connect(url.c_str())) {
+    ESP_LOGI(TAG, "Connecting to websocket server: %s with version: %d", url_.c_str(), version_);
+    if (!websocket_->Connect(url_.c_str())) {
         ESP_LOGE(TAG, "Failed to connect to websocket server");
         SetError(Lang::Strings::SERVER_NOT_CONNECTED);
         return false;
     }
+
+    xEventGroupClearBits(event_group_handle_, WEBSOCKET_PROTOCOL_SERVER_HELLO_EVENT);
 
     // Send hello message to describe the client
     auto message = GetHelloMessage();
@@ -192,11 +213,85 @@ bool WebsocketProtocol::OpenAudioChannel() {
         return false;
     }
 
-    if (on_audio_channel_opened_ != nullptr) {
-        on_audio_channel_opened_();
+    last_incoming_time_ = std::chrono::steady_clock::now();
+    return true;
+}
+
+/* 在 WsClient 的接收/心跳任务上被调用。这里不能销毁 websocket_ (那正是调用者
+ * 自己), 所以重连丢给一个一次性任务做。 */
+void WebsocketProtocol::HandleDisconnected(WsCloseReason reason) {
+    ESP_LOGW(TAG, "Websocket disconnected: %s", WsCloseReasonToString(reason));
+
+    if (closing_) {
+        return;  // 本端主动关闭, 调用方自己会处理状态
     }
 
-    return true;
+    /* 对端明确发 close 帧 = 服务器有意结束会话, 重连它大概率还会再关一次,
+     * 所以只对"异常"断开做重连。 */
+    if (reason == kWsClosePeer || reason == kWsCloseLocal) {
+        if (on_audio_channel_closed_ != nullptr) {
+            on_audio_channel_closed_();
+        }
+        return;
+    }
+
+    ScheduleReconnect();
+}
+
+void WebsocketProtocol::ScheduleReconnect() {
+    if (reconnecting_.exchange(true)) {
+        return;  // 已经在重连了
+    }
+
+    auto task = new std::function<void()>([this]() {
+        bool ok = false;
+        for (int attempt = 0; attempt < WEBSOCKET_MAX_RECONNECT_ATTEMPTS; attempt++) {
+            int delay_ms = 1000 << attempt;   // 1s / 2s / 4s
+            vTaskDelay(pdMS_TO_TICKS(delay_ms));
+
+            if (closing_) {
+                break;
+            }
+            ESP_LOGI(TAG, "Reconnecting websocket, attempt %d/%d",
+                     attempt + 1, WEBSOCKET_MAX_RECONNECT_ATTEMPTS);
+
+            /* 旧实例已经断开, 这里换新的。上一条连接的接收任务此刻不会再回调,
+             * 因为 WsClient 析构会先 Disconnect() 摘掉网桥 link。 */
+            websocket_.reset();
+            error_occurred_ = false;
+
+            if (EstablishConnection()) {
+                ok = true;
+                break;
+            }
+        }
+
+        reconnecting_ = false;
+
+        if (!ok) {
+            ESP_LOGE(TAG, "Websocket reconnect failed, closing audio channel");
+            websocket_.reset();
+            if (on_audio_channel_closed_ != nullptr) {
+                on_audio_channel_closed_();
+            }
+        } else {
+            ESP_LOGI(TAG, "Websocket reconnected, session=%s", session_id_.c_str());
+        }
+    });
+
+    if (xTaskCreate([](void* arg) {
+            auto fn = (std::function<void()>*)arg;
+            (*fn)();
+            delete fn;
+            vTaskDelete(NULL);
+        }, "ws_reconnect", 4096, task, 4, nullptr) != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create reconnect task");
+        delete task;
+        reconnecting_ = false;
+        if (on_audio_channel_closed_ != nullptr) {
+            on_audio_channel_closed_();
+        }
+    }
 }
 
 std::string WebsocketProtocol::GetHelloMessage() {
