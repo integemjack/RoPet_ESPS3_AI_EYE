@@ -15,17 +15,41 @@
 #include <netdb.h>
 #include <errno.h>
 
+#include <sys/time.h>
+
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 #include "freertos/queue.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "esp_tls.h"
 
 static const char *TAG = "bridge_sock";
 
 /* 单帧回传给 S3 的最大数据块, 需 <= BRIDGE_MAX_PAYLOAD */
 #define RX_CHUNK   1400
+
+/* 单次 recv/send 允许阻塞多久。
+ *
+ * esp-tls 建连时会给 socket 套上 10 秒的 SO_RCVTIMEO/SO_SNDTIMEO
+ * (cfg.timeout_ms 为 0 时取 ESP_TLS_DEFAULT_CONN_TIMEOUT), 而明文 TCP
+ * (is_plain_tcp) 的读写就是裸 recv/send —— 也就是说这 10 秒会原封不动地
+ * 落在我们身上。对发送方向尤其致命: bridge_sock_send 跑在 UART 收帧任务上,
+ * 一次阻塞就是 10 秒不读 UART, 而这根线没有硬件流控、ring buffer 只有 8192
+ * 字节, S3 侧继续发就会溢出丢帧。
+ *
+ * 所以显式压到一个短值, 让每次调用都尽快返回, 由上层循环决定要不要重试。 */
+#define SOCK_IO_TIMEOUT_MS   200
+
+/* 一帧数据总共允许重试多久。超过就认为这条链路已经写不动了。
+ * 注意这是"整帧"的预算, 不是单次调用的 —— 中途放弃会写坏 TCP 流,
+ * 详见 bridge_sock_send 里的说明。
+ *
+ * 上限受"堵住 UART 收帧任务多久才会丢帧"约束: 这条线没有硬件流控, C5 的接收
+ * ring buffer 是 8192 字节, 而 S3 上行只有 opus 音频 (16kbps, 约 2KB/s), 填满
+ * 约需 4 秒。取 2 秒留一半余量。 */
+#define SEND_DEADLINE_MS     2000
 
 typedef struct {
     bool           used;
@@ -69,6 +93,34 @@ static QueueHandle_t s_open_queue;
 
 static void sock_open_blocking(uint8_t link_id, bridge_proto_t proto,
                                const char *host, uint16_t port, uint32_t generation);
+
+/* errno 是否只表示"这次没做成, 再试就行", 而不是连接真的坏了。
+ *
+ * lwip 把 ERR_TIMEOUT 和 ERR_WOULDBLOCK 都映射成 EWOULDBLOCK (== EAGAIN),
+ * 所以阻塞 socket 上 SO_RCVTIMEO/SO_SNDTIMEO 到期和非阻塞 socket 的读空窗口
+ * 长得一模一样, 两者都必须放过。ENOMEM/ENOBUFS 是 lwip 的 pbuf 一时不够
+ * (发送高峰会遇到), 同样可重试。 */
+static inline bool sock_errno_retryable(int e)
+{
+    return e == EAGAIN || e == EWOULDBLOCK || e == EINTR ||
+           e == ENOMEM || e == ENOBUFS;
+}
+
+/* 把 recv/send 的阻塞时间压到 SOCK_IO_TIMEOUT_MS。
+ * esp-tls 默认给的是 10 秒, 对跑在 UART 收帧任务上的发送路径来说太长了。 */
+static void sock_set_io_timeout(esp_tls_t *tls)
+{
+    int fd = -1;
+    if (esp_tls_get_conn_sockfd(tls, &fd) != ESP_OK || fd < 0) {
+        return;
+    }
+    struct timeval tv = {
+        .tv_sec  = SOCK_IO_TIMEOUT_MS / 1000,
+        .tv_usec = (SOCK_IO_TIMEOUT_MS % 1000) * 1000,
+    };
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+}
 
 static void sock_open_worker(void *arg)
 {
@@ -178,17 +230,17 @@ static void tls_rx_task(void *arg)
          *
          * 这里原来只认 mbedtls 的 ESP_TLS_ERR_SSL_WANT_READ/WANT_WRITE (-0x6900
          * 一类的常量)。但明文 TCP 走的是 cfg.is_plain_tcp = true, 底层就是裸
-         * socket, 无数据可读时返回 -1/EAGAIN —— 和那两个常量根本不相等, 于是
-         * 每次读空窗口都被当成致命错误 break 掉, 表现为 WebSocket 隔十几秒
-         * 莫名断开一次 (间隔取决于流量节奏, 不是定时器)。
+         * socket, 读超时/无数据时返回 -1 并置 errno=EWOULDBLOCK —— 和那两个常量
+         * 根本不相等, 于是每次读空窗口都被当成致命错误 break 掉, 表现为
+         * WebSocket 隔十几秒莫名断开一次 (间隔取决于流量节奏, 不是定时器)。
          *
          * 所以两种模式都要放过: TLS 认 mbedtls 的 WANT_*, 明文 TCP 认
-         * EAGAIN/EWOULDBLOCK/EINTR (与下面 udp_rx_task 的处理一致)。 */
+         * 可重试的 errno (与下面 udp_rx_task 的处理一致)。 */
         if (n == ESP_TLS_ERR_SSL_WANT_READ || n == ESP_TLS_ERR_SSL_WANT_WRITE) {
             continue;
         }
-        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
-            /* 非阻塞 socket 的读空窗口。让出 CPU 再试, 否则这里会空转成忙等。 */
+        if (sock_errno_retryable(errno)) {
+            /* 读超时 / 读空窗口, 不是错误。让出 CPU 再试, 否则会空转成忙等。 */
             vTaskDelay(1);
             continue;
         }
@@ -355,6 +407,9 @@ static void sock_open_blocking(uint8_t link_id, bridge_proto_t proto,
             return;
         }
         lk->tls = tls;
+        /* 建连时 esp-tls 套了 10 秒的收发超时, 压到 SOCK_IO_TIMEOUT_MS,
+         * 否则一次写阻塞就能把 UART 收帧任务堵死 10 秒。 */
+        sock_set_io_timeout(tls);
         send_opened_result(link_id, true, 0);
         xTaskCreate(tls_rx_task, "lk_tls", 6144, RX_ARG_PACK(link_id, generation),
                     11, &lk->rx_task);
@@ -408,15 +463,51 @@ void bridge_sock_send(uint8_t link_id, const uint8_t *data, uint16_t len)
     if (lk->proto == BRIDGE_PROTO_UDP) {
         if (lk->udp_fd >= 0) send(lk->udp_fd, data, len, 0);
     } else if (lk->tls) {
+        /* 整帧必须写完, 不能中途放弃。
+         *
+         * 这里的数据是 S3 交下来的一个完整 WebSocket 帧。只写进去一半就 break,
+         * 等于往 TCP 流里插了半个帧: 服务器接着把后面的字节当帧头解析, 立刻
+         * 判定协议错误并关连接。这正是"说话说到一半 ws 莫名断开"的直接成因 ——
+         * 上行 opus 音频帧不断, 恰好撞上一次写不完就掉线。
+         *
+         * 原实现只认 mbedtls 的 WANT_WRITE/WANT_READ 作为可重试, 但明文 TCP 的
+         * send() 在发送窗口被打满 (说话时上行持续 16kbps, 弱信号下很常见) 时
+         * 返回 -1/EWOULDBLOCK, 于是直接走进 break 把帧写断。 */
         size_t written = 0;
+        int64_t deadline = esp_timer_get_time() + (int64_t)SEND_DEADLINE_MS * 1000;
         while (written < len && !lk->closing) {
+            errno = 0;
             int w = esp_tls_conn_write(lk->tls, data + written, len - written);
             if (w > 0) {
                 written += w;
-            } else if (w == ESP_TLS_ERR_SSL_WANT_WRITE || w == ESP_TLS_ERR_SSL_WANT_READ) {
+                continue;
+            }
+            if (w == ESP_TLS_ERR_SSL_WANT_WRITE || w == ESP_TLS_ERR_SSL_WANT_READ ||
+                sock_errno_retryable(errno)) {
+                if (esp_timer_get_time() > deadline) {
+                    ESP_LOGW(TAG, "link=%u send stalled, %u/%u bytes written",
+                             link_id, (unsigned)written, (unsigned)len);
+                    break;
+                }
                 vTaskDelay(pdMS_TO_TICKS(1));
-            } else {
-                break;    /* 写错误, 交给 rx_task 检测断开 */
+                continue;
+            }
+            ESP_LOGW(TAG, "link=%u write error w=%d errno=%d (%s), %u/%u bytes written",
+                     link_id, w, errno, strerror(errno),
+                     (unsigned)written, (unsigned)len);
+            break;
+        }
+
+        /* 没写完就说明流已经被写坏了 (或者链路本来就断了)。让它彻底断开并通知
+         * S3 重连, 而不是留着一条会持续吐垃圾的连接 —— 后者服务器迟早也会关,
+         * 但那期间的音频全是废的, 而且断开原因会变得没法诊断。
+         *
+         * 这里只 shutdown 唤醒 rx_task, 由它走正常的收尾流程上报 SOCK_CLOSED,
+         * 免得两边同时释放资源。 */
+        if (written < len && !lk->closing) {
+            int fd = -1;
+            if (esp_tls_get_conn_sockfd(lk->tls, &fd) == ESP_OK && fd >= 0) {
+                shutdown(fd, SHUT_RDWR);
             }
         }
     }
